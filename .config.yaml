@@ -118,7 +118,7 @@ FreeRTOS:
   Tasks:
     defaultTask:
       Priority: '24'
-      StackSize: 128B
+      StackSize: 1024B
       EntryFunction: StartDefaultTask
       Type: Default
   Heap: null

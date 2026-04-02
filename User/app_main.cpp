@@ -22,6 +22,33 @@
 using namespace LibXR;
 
 /* User Code Begin 1 */
+#include <cstdio>
+
+#include "FreeRTOS.h"
+#include "task.h"
+
+#include "application/imu_acquisition_task.hpp"
+#include "application/imu_uart_bridge_task.hpp"
+#include "managers/imu_manager.hpp"
+#include "managers/ws2812_manager.hpp"
+#include "modules/ws2812/ws2812_strip.hpp"
+
+extern UART_HandleTypeDef huart1;
+
+static void BootMark(char id) {
+  uint8_t msg[4] = {'B', ':', static_cast<uint8_t>(id), '\n'};
+  (void)HAL_UART_Transmit(&huart1, msg, sizeof(msg), 50);
+}
+
+static void BootValue(char tag, int32_t value) {
+  char line[32] = {0};
+  const int n = std::snprintf(line, sizeof(line), "%c:%ld\r\n", tag,
+                              static_cast<long>(value));
+  if (n > 0) {
+    (void)HAL_UART_Transmit(&huart1, reinterpret_cast<uint8_t *>(line),
+                            static_cast<uint16_t>(n), 50);
+  }
+}
 /* User Code End 1 */
 // NOLINTBEGIN
 // clang-format off
@@ -32,10 +59,10 @@ extern TIM_HandleTypeDef htim1;
 extern UART_HandleTypeDef huart1;
 
 /* DMA Resources */
-static uint8_t spi1_tx_buf[128] __attribute__((section(".axi_ram")));
-static uint8_t usart1_tx_buf[128] __attribute__((section(".axi_ram")));
-static uint8_t usart1_rx_buf[128] __attribute__((section(".axi_ram")));
-static uint8_t i2c1_buf[32] __attribute__((section(".axi_ram")));
+static uint8_t spi1_tx_buf[768];
+static uint8_t usart1_tx_buf[512];
+static uint8_t usart1_rx_buf[128];
+static uint8_t i2c1_buf[96];
 
 extern "C" void app_main(void) {
   // clang-format on
@@ -65,6 +92,44 @@ extern "C" void app_main(void) {
   // clang-format on
   // NOLINTEND
   /* User Code Begin 3 */
+  static Module::WS2812Strip ws2812_strip(&spi1);
+  static Manager::WS2812Manager ws2812_manager;
+  (void)ws2812_manager.Init(&ws2812_strip, 0);
+  BootMark('6');
+
+  static Manager::IMUManager imu_manager(Manager::ACTUAL_IMU_COUNT);
+  (void)imu_manager.Init(&i2c1, Manager::kDefaultImuAddress);
+  BootMark('7');
+  BootValue('H', static_cast<int32_t>(xPortGetFreeHeapSize()));
+
+  static Application::IMUAcquisitionConfig imu_acq_config;
+  imu_acq_config.period_ms = 20;
+  imu_acq_config.priority = static_cast<uint32_t>(Thread::Priority::MEDIUM);
+  imu_acq_config.stack_size = 768;
+
+  static Application::IMUAcquisitionTask imu_acq_task(&imu_manager, imu_acq_config);
+  const ErrorCode imu_start = imu_acq_task.Start();
+  BootValue('A', static_cast<int32_t>(imu_start));
+  BootValue('H', static_cast<int32_t>(xPortGetFreeHeapSize()));
+
+  static Application::IMUUartBridgeConfig bridge_config;
+  bridge_config.imu_addr = Manager::kDefaultImuAddress;
+  bridge_config.i2c_bus = 0;
+  bridge_config.spi_bus = 0;
+  bridge_config.read_timeout_ms = 50;
+  bridge_config.stream_relative_euler = false;
+  bridge_config.push_imu_euler_in_bridge = true;
+  bridge_config.stream_interval_ms = 20;
+  bridge_config.priority = static_cast<uint32_t>(Thread::Priority::MEDIUM);
+  bridge_config.stack_size = 768;
+
+  static Application::IMUUartBridgeTask bridge_task(
+      &usart1, &i2c1, &spi1, &imu_manager, &ws2812_manager, bridge_config);
+  const ErrorCode bridge_start = bridge_task.Start();
+  BootValue('R', static_cast<int32_t>(bridge_start));
+  BootValue('H', static_cast<int32_t>(xPortGetFreeHeapSize()));
+  BootMark('8');
+
   while(true) {
     Thread::Sleep(UINT32_MAX);
   }
