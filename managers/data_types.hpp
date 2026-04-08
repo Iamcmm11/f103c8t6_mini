@@ -6,14 +6,35 @@
 namespace Manager {
 
 constexpr uint8_t MAX_IMU_COUNT = 16;
-constexpr uint8_t ACTUAL_IMU_COUNT = 1;
-constexpr uint8_t kDefaultImuAddress = 0x50;
+constexpr uint8_t ACTUAL_IMU_COUNT = 3;
 
-constexpr uint8_t ResolveImuI2CAddress(uint8_t index,
-                                       uint8_t base_address =
-                                           kDefaultImuAddress) {
-  return static_cast<uint8_t>(base_address + index);
+enum class ImuSlot : uint8_t {
+  Forearm = 0,
+  Hand = 1,
+  ThumbRoot = 2,
+};
+
+static constexpr uint8_t kForearmImuI2CAddr = 0x50;
+static constexpr uint8_t kHandImuI2CAddr = 0x51;
+static constexpr uint8_t kThumbRootImuI2CAddr = 0x52;
+static constexpr uint8_t kDefaultImuAddress = kForearmImuI2CAddr;
+
+constexpr uint8_t ResolveImuI2CAddress(
+    uint8_t index, uint8_t base_address = kDefaultImuAddress) {
+  switch (index) {
+    case static_cast<uint8_t>(ImuSlot::Forearm):
+      return base_address;
+    case static_cast<uint8_t>(ImuSlot::Hand):
+      return static_cast<uint8_t>(base_address + 1U);
+    case static_cast<uint8_t>(ImuSlot::ThumbRoot):
+      return static_cast<uint8_t>(base_address + 2U);
+    default:
+      return base_address;
+  }
 }
+
+static_assert(ACTUAL_IMU_COUNT <= MAX_IMU_COUNT,
+              "ACTUAL_IMU_COUNT cannot exceed MAX_IMU_COUNT");
 
 struct IMUData {
   uint64_t timestamp_us = 0;

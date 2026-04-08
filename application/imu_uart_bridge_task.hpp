@@ -3,7 +3,7 @@
 #include <cstdint>
 
 #include "i2c.hpp"
-#include "imu_manager.hpp"
+#include "managers/imu_manager.hpp"
 #include "libxr_def.hpp"
 #include "message.hpp"
 #include "spi.hpp"
@@ -20,6 +20,7 @@ struct IMUUartBridgeConfig {
   uint32_t read_timeout_ms = 50;
   bool stream_relative_euler = true;
   bool push_imu_euler_in_bridge = true;
+  bool push_all_slots_in_bridge = true;
   uint32_t stream_interval_ms = 20;
   uint32_t priority = static_cast<uint32_t>(LibXR::Thread::Priority::MEDIUM);
   uint32_t stack_size = 768;

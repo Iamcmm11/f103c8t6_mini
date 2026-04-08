@@ -9,7 +9,7 @@ Raw serial monitor:
 
 Continuous IMU monitor:
   python3 /tmp/imu_uart_bridge_test.py --port /dev/ttyTCU0 console
-
+  python utils/python/imu_uart_bridge_test.py --port COM4 console 
 Examples:
   python3 /tmp/imu_uart_bridge_test.py --port /dev/ttyTCU0 ping
   python3 /tmp/imu_uart_bridge_test.py --port /dev/ttyTCU0 rgb 135 206 250
@@ -45,11 +45,13 @@ SOF1 = 0xAA
 CMD_PING = 0x01
 CMD_WS2812_FRAME = 0x21
 CMD_IMU_EULER_PUSH = 0x30
+CMD_IMU_DIAG_PUSH = 0x31
 
 STATUS_OK = 0
 DEFAULT_SPI_BUS = 0
 DEFAULT_LED_COUNT = 16
 MAX_FRAME_PAYLOAD = 1024
+IMU_PUSH_RECORD_SIZE = 13
 
 
 def calc_sum(data: bytes) -> int:
@@ -105,11 +107,15 @@ class BridgeClient:
         timeout: float,
         *,
         print_imu: bool = True,
+        imu_print_hz: float = 10.0,
     ) -> None:
         self._port = port
         self._baud = baud
         self._timeout = timeout
         self._print_imu = print_imu
+        self._imu_print_interval_s = (
+            0.0 if imu_print_hz <= 0.0 else 1.0 / imu_print_hz
+        )
         self._serial: Optional[Serial] = None
         self._stop_event = threading.Event()
         self._rx_thread: Optional[threading.Thread] = None
@@ -117,6 +123,12 @@ class BridgeClient:
         self._request_lock = threading.Lock()
         self._last_checksum_log_s = 0.0
         self._checksum_drop_count = 0
+        self._last_imu_print_s = 0.0
+        self._last_diag_print_s = 0.0
+        self._last_imu_line_len = 0
+        self._frame_ok_count = 0
+        self._frame_bad_count = 0
+        self._last_stats_print_s = 0.0
         self._response_queues = {
             CMD_PING: queue.Queue(),
             CMD_WS2812_FRAME: queue.Queue(),
@@ -133,7 +145,14 @@ class BridgeClient:
         if self._serial is not None:
             return
 
-        self._serial = serial.Serial(self._port, self._baud, timeout=self._timeout)
+        self._serial = serial.Serial(
+            self._port,
+            self._baud,
+            timeout=0,  # non-blocking read loop
+            bytesize=serial.EIGHTBITS,
+            parity=serial.PARITY_NONE,
+            stopbits=serial.STOPBITS_ONE,
+        )
         self._serial.reset_input_buffer()
         self._serial.reset_output_buffer()
         self._stop_event.clear()
@@ -145,6 +164,8 @@ class BridgeClient:
         if self._rx_thread is not None:
             self._rx_thread.join(timeout=1.0)
             self._rx_thread = None
+
+        self._end_imu_single_line()
 
         if self._serial is not None:
             self._serial.close()
@@ -202,17 +223,94 @@ class BridgeClient:
         return bytes(chunks)
 
     def _rx_loop(self) -> None:
+        rx_buf = bytearray()
         while not self._stop_event.is_set():
             try:
-                frame = self._read_frame()
-                if frame is None:
+                if self._serial is None:
+                    return
+
+                want = self._serial.in_waiting
+                if want <= 0:
+                    # Non-blocking poll, avoid busy-spin.
+                    time.sleep(0.001)
+                    self._print_rx_stats()
                     continue
-                cmd, payload = frame
-                self._dispatch_frame(cmd, payload)
+                chunk = self._serial.read(want)
+                if not chunk:
+                    self._print_rx_stats()
+                    continue
+                rx_buf.extend(chunk)
+                self._process_rx_buffer(rx_buf)
+                self._print_rx_stats()
             except serial.SerialException:
                 return
             except Exception as exc:
                 print(f"[bridge] rx error: {exc}", file=sys.stderr, flush=True)
+
+    def _process_rx_buffer(self, rx_buf: bytearray) -> None:
+        while True:
+            sof_index = rx_buf.find(bytes([SOF0, SOF1]))
+            if sof_index < 0:
+                # Keep one tail byte in case it's SOF0 for the next chunk.
+                if len(rx_buf) > 1:
+                    del rx_buf[:-1]
+                return
+
+            if sof_index > 0:
+                del rx_buf[:sof_index]
+
+            if len(rx_buf) < 5:
+                return
+
+            cmd = rx_buf[2]
+            payload_len = rx_buf[3] | (rx_buf[4] << 8)
+            if payload_len > MAX_FRAME_PAYLOAD:
+                # Invalid header length, slide one byte and resync.
+                del rx_buf[0]
+                continue
+
+            total_len = 5 + payload_len + 1
+            if len(rx_buf) < total_len:
+                return
+
+            header = bytes(rx_buf[:5])
+            payload = bytes(rx_buf[5 : 5 + payload_len])
+            checksum = rx_buf[5 + payload_len]
+            expect = (calc_sum(header) + calc_sum(payload)) & 0xFF
+            if checksum != expect:
+                self._frame_bad_count += 1
+                self._checksum_drop_count += 1
+                now = time.monotonic()
+                if now - self._last_checksum_log_s > 1.0:
+                    print(
+                        f"[bridge] checksum mismatch: rx=0x{checksum:02X}, expect=0x{expect:02X}, drops={self._checksum_drop_count}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    self._last_checksum_log_s = now
+                    self._checksum_drop_count = 0
+                # Slide one byte instead of dropping the whole candidate frame.
+                del rx_buf[0]
+                continue
+
+            del rx_buf[:total_len]
+            self._frame_ok_count += 1
+            self._dispatch_frame(cmd, payload)
+
+    def _print_rx_stats(self) -> None:
+        now = time.monotonic()
+        if now - self._last_stats_print_s < 1.0:
+            return
+        total = self._frame_ok_count + self._frame_bad_count
+        if total > 0:
+            bad_pct = (self._frame_bad_count * 100.0) / total
+            print(
+                f"[bridge] rx stats: total={total}, ok={self._frame_ok_count}, bad={self._frame_bad_count}, bad_pct={bad_pct:.2f}%",
+                file=sys.stderr,
+            )
+        self._frame_ok_count = 0
+        self._frame_bad_count = 0
+        self._last_stats_print_s = now
 
     def _read_frame(self) -> Optional[tuple[int, bytes]]:
         if self._serial is None:
@@ -270,12 +368,16 @@ class BridgeClient:
         if cmd == CMD_IMU_EULER_PUSH:
             self._handle_imu_push(payload)
             return
+        if cmd == CMD_IMU_DIAG_PUSH:
+            # Diag frames are intentionally ignored in monitor output.
+            return
 
         resp_queue = self._response_queues.setdefault(cmd, queue.Queue())
         resp_queue.put(payload)
 
     def _handle_imu_push(self, payload: bytes) -> None:
-        if len(payload) != 13:
+        imu_records = self._parse_imu_push(payload)
+        if imu_records is None:
             print(
                 f"[bridge] invalid IMU push length: {len(payload)}",
                 file=sys.stderr,
@@ -283,12 +385,97 @@ class BridgeClient:
             )
             return
 
-        imu_addr, roll_deg, pitch_deg, yaw_deg = struct.unpack("<Bfff", payload)
-        if self._print_imu:
+        if self._print_imu and imu_records:
+            now = time.monotonic()
+            if (
+                self._imu_print_interval_s > 0.0
+                and (now - self._last_imu_print_s) < self._imu_print_interval_s
+            ):
+                return
+            self._last_imu_print_s = now
+            line = ",".join(
+                ["imu_bundle", str(len(imu_records))]
+                + [
+                    item
+                    for imu_addr, roll_deg, pitch_deg, yaw_deg in imu_records
+                    for item in (
+                        f"0x{imu_addr:02X}",
+                        f"{roll_deg:.3f}",
+                        f"{pitch_deg:.3f}",
+                        f"{yaw_deg:.3f}",
+                    )
+                ]
+            )
+            self._print_imu_single_line(line)
+
+    def _print_imu_single_line(self, line: str) -> None:
+        extra = self._last_imu_line_len - len(line)
+        if extra > 0:
+            line = line + (" " * extra)
+        sys.stdout.write("\r" + line)
+        sys.stdout.flush()
+        self._last_imu_line_len = len(line)
+
+    def _end_imu_single_line(self) -> None:
+        if self._last_imu_line_len > 0:
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+            self._last_imu_line_len = 0
+
+    def _parse_imu_push(
+        self, payload: bytes
+    ) -> Optional[list[tuple[int, float, float, float]]]:
+        if len(payload) == IMU_PUSH_RECORD_SIZE:
+            return [struct.unpack("<Bfff", payload)]
+
+        if len(payload) < 1:
+            return None
+
+        imu_count = payload[0]
+        records_raw = payload[1:]
+        if len(records_raw) != imu_count * IMU_PUSH_RECORD_SIZE:
+            return None
+
+        imu_records: list[tuple[int, float, float, float]] = []
+        for offset in range(0, len(records_raw), IMU_PUSH_RECORD_SIZE):
+            imu_records.append(
+                struct.unpack(
+                    "<Bfff",
+                    records_raw[offset : offset + IMU_PUSH_RECORD_SIZE],
+                )
+            )
+        return imu_records
+
+    def _handle_imu_diag_push(self, payload: bytes) -> None:
+        if len(payload) != 11:
             print(
-                f"imu,0x{imu_addr:02X},{roll_deg:.3f},{pitch_deg:.3f},{yaw_deg:.3f}",
+                f"[bridge] invalid IMU diag length: {len(payload)}",
+                file=sys.stderr,
                 flush=True,
             )
+            return
+
+        now = time.monotonic()
+        if (
+            self._imu_print_interval_s > 0.0
+            and (now - self._last_diag_print_s) < self._imu_print_interval_s
+        ):
+            return
+        self._last_diag_print_s = now
+        self._end_imu_single_line()
+
+        seq, online_mask, valid_mask, online_count, valid_count, capacity = struct.unpack(
+            "<IHHBBB", payload
+        )
+        print(
+            "imu_diag,"
+            f"seq,{seq},"
+            f"online_mask,0x{online_mask:04X},"
+            f"valid_mask,0x{valid_mask:04X},"
+            f"online_count,{online_count},"
+            f"valid_count,{valid_count},"
+            f"capacity,{capacity}",
+        )
 
 
 class BlinkWorker:
@@ -509,6 +696,15 @@ def cmd_console(client: BridgeClient, args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_monitor(client: BridgeClient, _args: argparse.Namespace) -> int:
+    print("Monitor mode started. Waiting for IMU push frames, press Ctrl+C to stop.")
+    try:
+        while True:
+            time.sleep(0.2)
+    except KeyboardInterrupt:
+        return 0
+
+
 def add_ws_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--spi-bus", type=lambda x: int(x, 0), default=DEFAULT_SPI_BUS, help="SPI bus id"
@@ -526,6 +722,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--port", required=True, help="serial port, e.g. COM12 or /dev/ttyUSB0")
     parser.add_argument("--baud", type=int, default=115200, help="serial baudrate")
     parser.add_argument("--timeout", type=float, default=0.1, help="serial timeout in seconds")
+    parser.add_argument(
+        "--imu-print-hz",
+        type=float,
+        default=10.0,
+        help="max print rate for imu_bundle/imu_diag (0 means print every frame)",
+    )
 
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -570,6 +772,12 @@ def build_parser() -> argparse.ArgumentParser:
     add_ws_common_args(console_parser)
     console_parser.set_defaults(func=cmd_console)
 
+    monitor_parser = subparsers.add_parser(
+        "monitor",
+        help="receive and print IMU push frames only",
+    )
+    monitor_parser.set_defaults(func=cmd_monitor)
+
     return parser
 
 
@@ -578,7 +786,13 @@ def main() -> int:
     args = parser.parse_args()
 
     try:
-        with BridgeClient(args.port, args.baud, args.timeout, print_imu=True) as client:
+        with BridgeClient(
+            args.port,
+            args.baud,
+            args.timeout,
+            print_imu=True,
+            imu_print_hz=args.imu_print_hz,
+        ) as client:
             return args.func(client, args)
     except serial.SerialException as exc:
         print(f"serial error: {exc}", file=sys.stderr)

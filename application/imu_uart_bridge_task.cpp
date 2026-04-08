@@ -3,7 +3,10 @@
 #include <array>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 
+#include "FreeRTOS.h"
+#include "task.h"
 #include "semaphore.hpp"
 
 namespace {
@@ -19,8 +22,17 @@ constexpr uint8_t kBridgeCmdIMUEulerPush = 0x30;
 constexpr uint8_t kBridgeStatusOk = 0;
 constexpr uint8_t kBridgeStatusError = 1;
 constexpr uint8_t kMaxRegisterCount = 32;
+constexpr uint16_t kBridgeMaxResponsePayload = 80;
 constexpr uint16_t kBridgeChunkSize = 32;
 constexpr uint32_t kBridgePollTimeoutMs = 2;
+constexpr uint8_t kBridgeIMUPushRecordSize = 13;
+constexpr uint32_t kTaskCreateOverheadBytes = 384;
+constexpr uint32_t kTaskCreateSafetyBytes = 256;
+constexpr std::array<uint8_t, 3> kBridgeIMUPushIndexes = {
+    static_cast<uint8_t>(Manager::ImuSlot::Forearm),
+    static_cast<uint8_t>(Manager::ImuSlot::Hand),
+    static_cast<uint8_t>(Manager::ImuSlot::ThumbRoot),
+};
 
 }  // namespace
 
@@ -49,6 +61,12 @@ ErrorCode IMUUartBridgeTask::Start() {
   }
   if (uart_ == nullptr || i2c_ == nullptr || imu_mgr_ == nullptr) {
     return ErrorCode::PTR_NULL;
+  }
+
+  const size_t required_heap = static_cast<size_t>(config_.stack_size) +
+                               kTaskCreateOverheadBytes + kTaskCreateSafetyBytes;
+  if (xPortGetFreeHeapSize() < required_heap) {
+    return ErrorCode::NO_MEM;
   }
 
   running_ = true;
@@ -250,19 +268,23 @@ bool IMUUartBridgeTask::WriteSPI(const uint8_t* buf, uint16_t len) {
 
 void IMUUartBridgeTask::SendResponse(uint8_t cmd, const uint8_t* payload,
                                      uint16_t len) {
-  const uint8_t hdr[5] = {kBridgeSof0, kBridgeSof1, cmd,
-                          static_cast<uint8_t>(len & 0xFFU),
-                          static_cast<uint8_t>((len >> 8U) & 0xFFU)};
-  const uint8_t checksum = static_cast<uint8_t>(
-      CalcSum(hdr, sizeof(hdr)) + CalcSum(payload, len));
+  if (len > kBridgeMaxResponsePayload) {
+    return;
+  }
 
-  if (!WriteExact(hdr, sizeof(hdr))) {
-    return;
+  std::array<uint8_t, 5 + kBridgeMaxResponsePayload + 1> frame{};
+  frame[0] = kBridgeSof0;
+  frame[1] = kBridgeSof1;
+  frame[2] = cmd;
+  frame[3] = static_cast<uint8_t>(len & 0xFFU);
+  frame[4] = static_cast<uint8_t>((len >> 8U) & 0xFFU);
+  if (len > 0 && payload != nullptr) {
+    std::memcpy(frame.data() + 5, payload, len);
   }
-  if (len > 0 && !WriteExact(payload, len)) {
-    return;
-  }
-  (void)WriteExact(&checksum, 1);
+  frame[5 + len] = static_cast<uint8_t>(
+      CalcSum(frame.data(), static_cast<uint16_t>(5 + len)));
+
+  (void)WriteExact(frame.data(), static_cast<uint16_t>(6 + len));
 }
 
 void IMUUartBridgeTask::HandleCommand(uint8_t cmd, uint16_t payload_len) {
@@ -497,15 +519,43 @@ void IMUUartBridgeTask::PublishBridgeIMUData() {
       (config_.stream_interval_ms == 0U) ||
       ((now_ms - last_bridge_push_ms_) >= config_.stream_interval_ms);
 
-  if (interval_ok && imu_msg.IsValid(0)) {
-    const auto& imu = imu_msg.imu_data[0];
-    uint8_t payload[13] = {0};
-    payload[0] = config_.imu_addr;
-    std::memcpy(&payload[1], &imu.angle[0], sizeof(float));
-    std::memcpy(&payload[5], &imu.angle[1], sizeof(float));
-    std::memcpy(&payload[9], &imu.angle[2], sizeof(float));
-    SendResponse(kBridgeCmdIMUEulerPush, payload, sizeof(payload));
-    last_bridge_push_ms_ = now_ms;
+  if (interval_ok) {
+    std::array<uint8_t,
+               1 + kBridgeIMUPushIndexes.size() * kBridgeIMUPushRecordSize>
+        payload{};
+    payload[0] = 0;
+    uint16_t payload_len = 1;
+
+    for (const uint8_t imu_index : kBridgeIMUPushIndexes) {
+      const bool valid = imu_msg.IsValid(imu_index);
+      if (!valid && !config_.push_all_slots_in_bridge) {
+        continue;
+      }
+
+      float roll = std::numeric_limits<float>::quiet_NaN();
+      float pitch = std::numeric_limits<float>::quiet_NaN();
+      float yaw = std::numeric_limits<float>::quiet_NaN();
+      if (valid) {
+        const auto& imu = imu_msg.imu_data[imu_index];
+        roll = imu.angle[0];
+        pitch = imu.angle[1];
+        yaw = imu.angle[2];
+      }
+
+      const uint16_t base = payload_len;
+      payload[base] = Manager::ResolveImuI2CAddress(imu_index, config_.imu_addr);
+      std::memcpy(payload.data() + base + 1, &roll, sizeof(float));
+      std::memcpy(payload.data() + base + 5, &pitch, sizeof(float));
+      std::memcpy(payload.data() + base + 9, &yaw, sizeof(float));
+      ++payload[0];
+      payload_len =
+          static_cast<uint16_t>(payload_len + kBridgeIMUPushRecordSize);
+    }
+
+    if (payload[0] > 0) {
+      SendResponse(kBridgeCmdIMUEulerPush, payload.data(), payload_len);
+      last_bridge_push_ms_ = now_ms;
+    }
   }
 
   imu_subscriber_->StartWaiting();

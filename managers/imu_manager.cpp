@@ -1,21 +1,45 @@
 #include "imu_manager.hpp"
 
+#include "FreeRTOS.h"
+#include "task.h"
+
+#include "libxr_rw.hpp"
 #include "stm32_timebase.hpp"
 
 namespace Manager {
 
 using namespace LibXR;
 
+namespace {
+
+constexpr uint32_t kDataRegStart = 0x34;
+constexpr uint32_t kDataRegCount = 13;
+constexpr uint32_t kQuatRegStart = 0x51;
+constexpr uint32_t kQuatRegCount = 4;
+constexpr uint32_t kInitBootDelayMs = 120;
+constexpr uint32_t kInitProbeRetryCount = 5;
+constexpr uint32_t kInitProbeRetryDelayMs = 25;
+constexpr uint32_t kAcquisitionStackBytes = 1024;
+constexpr uint32_t kTaskCreateOverheadBytes = 384;
+constexpr uint32_t kTaskCreateSafetyBytes = 256;
+
+}  // namespace
+
 IMUManager::IMUManager(uint8_t imu_count)
     : i2c_(nullptr),
       imu_count_(imu_count > MAX_IMU_COUNT ? MAX_IMU_COUNT : imu_count),
       base_address_(kDefaultImuAddress),
       online_mask_(0),
-      sequence_(0) {
+      sequence_(0),
+      data_topic_(nullptr),
+      running_(false),
+      frequency_hz_(100) {
   imus_.fill(nullptr);
 }
 
 IMUManager::~IMUManager() {
+  StopAcquisition();
+
   for (auto*& imu : imus_) {
     delete imu;
     imu = nullptr;
@@ -30,6 +54,10 @@ ErrorCode IMUManager::Init(I2C* i2c, uint8_t base_address) {
   i2c_ = i2c;
   base_address_ = base_address;
   online_mask_ = 0;
+  sequence_ = 0;
+
+  // Give all IMUs time to finish power-up before first probe.
+  Thread::Sleep(kInitBootDelayMs);
 
   uint8_t success_count = 0;
   for (uint8_t i = 0; i < imu_count_; ++i) {
@@ -39,8 +67,21 @@ ErrorCode IMUManager::Init(I2C* i2c, uint8_t base_address) {
       continue;
     }
 
-    if (imus_[i]->Init() == Module::WitIMU::ErrorCode::OK) {
-      online_mask_ = static_cast<uint16_t>(online_mask_ | (1u << i));
+    if (imus_[i]->Init() != Module::WitIMU::ErrorCode::OK) {
+      continue;
+    }
+
+    bool online = false;
+    for (uint32_t attempt = 0; attempt < kInitProbeRetryCount; ++attempt) {
+      if (ProbeIMU(i)) {
+        online = true;
+        break;
+      }
+      if ((attempt + 1U) < kInitProbeRetryCount) {
+        Thread::Sleep(kInitProbeRetryDelayMs);
+      }
+    }
+    if (online) {
       ++success_count;
     }
   }
@@ -55,19 +96,15 @@ ErrorCode IMUManager::ReadAll(IMUArrayMsg& msg) {
   msg.sequence = sequence_++;
 
   uint8_t valid_count = 0;
-  for (uint8_t i = 0; i < imu_count_ && i < ACTUAL_IMU_COUNT; ++i) {
+  const uint8_t scan_count =
+      (imu_count_ < ACTUAL_IMU_COUNT) ? imu_count_ : ACTUAL_IMU_COUNT;
+  for (uint8_t i = 0; i < scan_count; ++i) {
     if (imus_[i] == nullptr || !IsIMUOnline(i)) {
       continue;
     }
 
-    if (imus_[i]->ReadReg(0x34, 13) != Module::WitIMU::ErrorCode::OK) {
-      continue;
-    }
-
-    imus_[i]->UpdateDataFromRegisters();
     Module::WitIMU::ImuData raw{};
-    imus_[i]->GetData(raw);
-    if (!(raw.acc_valid || raw.gyro_valid || raw.angle_valid)) {
+    if (!ReadRawIMU(i, raw)) {
       continue;
     }
 
@@ -90,20 +127,72 @@ ErrorCode IMUManager::ReadSingle(uint8_t index, IMUData& data) {
   }
 
   Mutex::LockGuard guard(bus_mutex_);
-  if (imus_[index]->ReadReg(0x34, 13) != Module::WitIMU::ErrorCode::OK) {
-    return ErrorCode::FAILED;
-  }
-
-  imus_[index]->UpdateDataFromRegisters();
   Module::WitIMU::ImuData raw{};
-  imus_[index]->GetData(raw);
-  if (!(raw.acc_valid || raw.gyro_valid || raw.angle_valid)) {
+  if (!ReadRawIMU(index, raw)) {
     return ErrorCode::FAILED;
   }
 
   ConvertIMUData(raw, data);
   data.timestamp_us = Timebase::GetMicroseconds();
   return ErrorCode::OK;
+}
+
+ErrorCode IMUManager::StartAcquisition(uint32_t frequency_hz,
+                                       const char* topic_name) {
+  if (running_) {
+    return ErrorCode::BUSY;
+  }
+  if (frequency_hz == 0U) {
+    return ErrorCode::ARG_ERR;
+  }
+  if (online_mask_ == 0U) {
+    return ErrorCode::INIT_ERR;
+  }
+
+  const size_t required_heap = static_cast<size_t>(kAcquisitionStackBytes) +
+                               kTaskCreateOverheadBytes + kTaskCreateSafetyBytes;
+  if (xPortGetFreeHeapSize() < required_heap) {
+    return ErrorCode::NO_MEM;
+  }
+
+  if (data_topic_ != nullptr) {
+    delete data_topic_;
+    data_topic_ = nullptr;
+  }
+
+  if (topic_name != nullptr) {
+    data_topic_ =
+        new Topic(topic_name, sizeof(IMUArrayMsg), nullptr, false, false, false);
+    if (data_topic_ == nullptr) {
+      return ErrorCode::NO_MEM;
+    }
+  }
+
+  frequency_hz_ = frequency_hz;
+  running_ = true;
+  acquisition_thread_.Create(this, AcquisitionThreadFunc, "IMUMgrAcq",
+                             kAcquisitionStackBytes,
+                             Thread::Priority::HIGH);
+  return ErrorCode::OK;
+}
+
+void IMUManager::StopAcquisition() {
+  if (!running_) {
+    return;
+  }
+
+  running_ = false;
+
+  uint32_t period_ms = (frequency_hz_ > 0U) ? (1000U / frequency_hz_) : 1U;
+  if (period_ms == 0U) {
+    period_ms = 1U;
+  }
+  Thread::Sleep(period_ms * 2U);
+
+  if (data_topic_ != nullptr) {
+    delete data_topic_;
+    data_topic_ = nullptr;
+  }
 }
 
 bool IMUManager::IsIMUOnline(uint8_t index) const {
@@ -123,6 +212,66 @@ uint8_t IMUManager::GetOnlineCount() const {
 bool IMUManager::AcquireBus() { return bus_mutex_.Lock() == ErrorCode::OK; }
 
 void IMUManager::ReleaseBus() { bus_mutex_.Unlock(); }
+
+bool IMUManager::ReadRawIMU(uint8_t index, Module::WitIMU::ImuData& raw_data) {
+  if (index >= imu_count_ || imus_[index] == nullptr) {
+    return false;
+  }
+
+  if (imus_[index]->ReadReg(kDataRegStart, kDataRegCount) !=
+      Module::WitIMU::ErrorCode::OK) {
+    return false;
+  }
+
+  // Keep the reference behavior: quaternion read failure does not block main data.
+  (void)imus_[index]->ReadReg(kQuatRegStart, kQuatRegCount);
+  imus_[index]->UpdateDataFromRegisters();
+  imus_[index]->GetData(raw_data);
+
+  return raw_data.acc_valid || raw_data.gyro_valid || raw_data.angle_valid;
+}
+
+bool IMUManager::ProbeIMU(uint8_t index) {
+  if (index >= imu_count_ || imus_[index] == nullptr) {
+    return false;
+  }
+
+  Module::WitIMU::ImuData raw{};
+  if (!ReadRawIMU(index, raw)) {
+    online_mask_ = static_cast<uint16_t>(online_mask_ & ~(1u << index));
+    return false;
+  }
+
+  online_mask_ = static_cast<uint16_t>(online_mask_ | (1u << index));
+  (void)imus_[index]->SetAxis9();
+  return true;
+}
+
+void IMUManager::AcquisitionThreadFunc(IMUManager* manager) {
+  if (manager == nullptr) {
+    return;
+  }
+
+  uint32_t period_ms =
+      (manager->frequency_hz_ > 0U) ? (1000U / manager->frequency_hz_) : 1U;
+  if (period_ms == 0U) {
+    period_ms = 1U;
+  }
+
+  MillisecondTimestamp last_wakeup(Thread::GetTime());
+  while (manager->running_) {
+    IMUArrayMsg msg;
+    if (manager->ReadAll(msg) == ErrorCode::OK) {
+      if (manager->data_topic_ != nullptr) {
+        manager->data_topic_->Publish(msg);
+      }
+    }
+    if (!manager->running_) {
+      break;
+    }
+    Thread::SleepUntil(last_wakeup, period_ms);
+  }
+}
 
 void IMUManager::ConvertIMUData(const Module::WitIMU::ImuData& src,
                                 IMUData& dst) const {
