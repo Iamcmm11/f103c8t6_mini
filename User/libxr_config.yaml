@@ -1,26 +1,26 @@
-terminal_source: ''
+terminal_source: usart1
 software_timer:
   priority: 2
   stack_depth: 1024
 SPI:
   spi1:
-    tx_buffer_size: 32
+    tx_buffer_size: 768
     rx_buffer_size: 32
     dma_section: ''
     dma_enable_min_size: 3
 I2C:
   i2c1:
-    buffer_size: 32
+    buffer_size: 96
     dma_section: ''
     dma_enable_min_size: 3
 USART:
   uart5:
-    tx_buffer_size: 128
+    tx_buffer_size: 512
     rx_buffer_size: 128
     dma_section: ''
     tx_queue_size: 5
   usart1:
-    tx_buffer_size: 128
+    tx_buffer_size: 512
     rx_buffer_size: 128
     dma_section: ''
     tx_queue_size: 5
@@ -29,6 +29,7 @@ Terminal:
   max_line_size: 32
   max_arg_number: 5
   max_history_number: 5
+  run_as_thread: false
 SYSTEM: FreeRTOS
 FlashLayout:
   model: STM32F105RCT6

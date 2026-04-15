@@ -1,0 +1,40 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "F105 OpenOCD Debug",
+            "request": "launch",
+            "type": "cortex-debug",
+            "cwd": "${workspaceFolder}",
+            "executable": "${workspaceFolder}/build/Debug/f105rct6.elf",
+            "servertype": "openocd",
+            "configFiles": [
+                "interface/cmsis-dap.cfg",
+                "target/stm32f1x.cfg"
+            ],
+            "serverpath": "${env:OPENOCD_HOME}/bin/openocd.exe",
+            "searchDir": [
+                "${env:OPENOCD_HOME}/openocd/scripts"
+            ],
+            "runToEntryPoint": "main",
+            "showDevDebugOutput": "none",
+            "gdbPath": "${env:ARM_GCC_HOME}/bin/arm-none-eabi-gdb",
+            "interface": "swd",
+            "device": "STM32F105RC"
+        },
+        {
+            "name": "F105 JLink Debug",
+            "request": "launch",
+            "type": "cortex-debug",
+            "cwd": "${workspaceFolder}",
+            "executable": "${workspaceFolder}/build/Debug/f105rct6.elf",
+            "servertype": "jlink",
+            "serverpath": "${env:JLINK_HOME}/JLinkGDBServerCL.exe",
+            "device": "STM32F105RC",
+            "interface": "swd",
+            "runToEntryPoint": "main",
+            "showDevDebugOutput": "none",
+            "gdbPath": "${env:ARM_GCC_HOME}/bin/arm-none-eabi-gdb"
+        }
+    ]
+}

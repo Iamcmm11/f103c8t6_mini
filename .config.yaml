@@ -1,4 +1,6 @@
-GPIO: {}
+GPIO:
+  PA4:
+    Signal: GPIO_Output
 Peripherals:
   ADC: {}
   SPI:
