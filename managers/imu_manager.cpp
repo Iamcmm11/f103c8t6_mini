@@ -13,13 +13,17 @@ using namespace LibXR;
 
 namespace {
 
+// JY901B 连续数据区起始寄存器：加速度、角速度、磁场、欧拉角等都从这里往后读取。
 constexpr uint32_t kDataRegStart = 0x34;
 constexpr uint32_t kDataRegCount = 13;
+// 四元数数据单独放在另一段寄存器区。
 constexpr uint32_t kQuatRegStart = 0x51;
 constexpr uint32_t kQuatRegCount = 4;
+// 给 IMU 上电稳定留一点时间，再开始初始化探测。
 constexpr uint32_t kInitBootDelayMs = 120;
 constexpr uint32_t kInitProbeRetryCount = 5;
 constexpr uint32_t kInitProbeRetryDelayMs = 25;
+// 采集线程使用的任务栈和预留堆空间。
 constexpr uint32_t kAcquisitionStackBytes = 1024;
 constexpr uint32_t kTaskCreateOverheadBytes = 384;
 constexpr uint32_t kTaskCreateSafetyBytes = 256;
@@ -41,6 +45,7 @@ IMUManager::IMUManager(uint8_t imu_count)
 IMUManager::~IMUManager() {
   StopAcquisition();
 
+  // manager 销毁时统一释放底层 Module::WitIMU 对象，避免资源泄漏。
   for (auto*& imu : imus_) {
     delete imu;
     imu = nullptr;
@@ -57,6 +62,7 @@ ErrorCode IMUManager::Init(I2C* i2c, uint8_t base_address) {
   online_mask_ = 0;
   sequence_ = 0;
 
+  // 让传感器有充足的上电稳定时间，避免刚上电时探测失败。
   Thread::Sleep(kInitBootDelayMs);
 
   uint8_t success_count = 0;
@@ -71,6 +77,7 @@ ErrorCode IMUManager::Init(I2C* i2c, uint8_t base_address) {
       continue;
     }
 
+    // 上电阶段可能存在偶发探测失败，这里做有限次重试提高成功率。
     bool online = false;
     for (uint32_t attempt = 0; attempt < kInitProbeRetryCount; ++attempt) {
       if (ProbeIMU(i)) {
@@ -90,6 +97,7 @@ ErrorCode IMUManager::Init(I2C* i2c, uint8_t base_address) {
 }
 
 ErrorCode IMUManager::ReadAll(IMUArrayMsg& msg) {
+  // 采集线程和桥接线程都可能访问 I2C，总线读流程必须串行化。
   Mutex::LockGuard guard(bus_mutex_);
 
   msg = IMUArrayMsg{};
@@ -108,6 +116,7 @@ ErrorCode IMUManager::ReadAll(IMUArrayMsg& msg) {
       continue;
     }
 
+    // 这里把底层模块量纲转换成对业务层友好的统一结构，并补上时间戳。
     ConvertIMUData(raw, msg.imu_data[i]);
     msg.imu_data[i].timestamp_us = Timebase::GetMicroseconds();
     msg.SetValid(i, true);
@@ -152,6 +161,7 @@ ErrorCode IMUManager::StartAcquisition(uint32_t frequency_hz,
   const size_t required_heap = static_cast<size_t>(kAcquisitionStackBytes) +
                                kTaskCreateOverheadBytes +
                                kTaskCreateSafetyBytes;
+  // 在线程创建前先检查 FreeRTOS 剩余堆，避免任务起到一半因为内存不足失败。
   if (xPortGetFreeHeapSize() < required_heap) {
     return ErrorCode::NO_MEM;
   }
@@ -171,6 +181,7 @@ ErrorCode IMUManager::StartAcquisition(uint32_t frequency_hz,
 
   frequency_hz_ = frequency_hz;
   running_ = true;
+  // 采集任务优先级设成 HIGH，保证姿态数据尽量按频率稳定产生。
   acquisition_thread_.Create(this, AcquisitionThreadFunc, "IMUMgrAcq",
                              kAcquisitionStackBytes, Thread::Priority::HIGH);
   return ErrorCode::OK;
@@ -187,6 +198,7 @@ void IMUManager::StopAcquisition() {
   if (period_ms == 0U) {
     period_ms = 1U;
   }
+  // 给线程留出 1~2 个周期自然退出的时间，再回收 Topic 资源。
   Thread::Sleep(period_ms * 2U);
 
   if (data_topic_ != nullptr) {
@@ -223,6 +235,7 @@ bool IMUManager::ReadRawIMU(uint8_t index, Module::WitIMU::ImuData& raw_data) {
     return false;
   }
 
+  // 先读主数据区，再补读四元数区；四元数失败时其余姿态数据仍然允许保留。
   const bool quat_ok =
       imus_[index]->ReadReg(kQuatRegStart, kQuatRegCount) ==
       Module::WitIMU::ErrorCode::OK;
@@ -245,6 +258,7 @@ bool IMUManager::ProbeIMU(uint8_t index) {
     return false;
   }
 
+  // Probe 本质上就是做一次真实读操作：能读通就记为在线，并切到 9 轴融合模式。
   Module::WitIMU::ImuData raw{};
   if (!ReadRawIMU(index, raw)) {
     online_mask_ = static_cast<uint16_t>(online_mask_ & ~(1u << index));
@@ -272,6 +286,7 @@ void IMUManager::AcquisitionThreadFunc(IMUManager* manager) {
     IMUArrayMsg msg;
     if (manager->ReadAll(msg) == ErrorCode::OK) {
       if (manager->data_topic_ != nullptr) {
+        // 采到新数据后立刻发布，桥接层和其它订阅者只需监听 imu_data 即可。
         manager->data_topic_->Publish(msg);
       }
     }
@@ -284,10 +299,12 @@ void IMUManager::AcquisitionThreadFunc(IMUManager* manager) {
 
 void IMUManager::ConvertIMUData(const Module::WitIMU::ImuData& src,
                                 IMUData& dst) const {
+  // 底层模块给出的是芯片原始量纲，这里统一转换为业务层固定使用的单位。
   dst.acc[0] = src.acc_x * 9.80665f;
   dst.acc[1] = src.acc_y * 9.80665f;
   dst.acc[2] = src.acc_z * 9.80665f;
 
+  // JY901B 输出角速度单位为 deg/s，这里转成 rad/s 方便后续算法统一处理。
   constexpr float kDegToRad = 0.0174532925f;
   dst.gyro[0] = src.gyro_x * kDegToRad;
   dst.gyro[1] = src.gyro_y * kDegToRad;
@@ -307,6 +324,7 @@ void IMUManager::ConvertIMUData(const Module::WitIMU::ImuData& src,
     dst.quaternion[2] = src.q2;
     dst.quaternion[3] = src.q3;
   } else {
+    // 四元数未读到时保留 NaN，方便上层一眼看出该字段当前不可用。
     const float nan = std::numeric_limits<float>::quiet_NaN();
     dst.quaternion[0] = nan;
     dst.quaternion[1] = nan;

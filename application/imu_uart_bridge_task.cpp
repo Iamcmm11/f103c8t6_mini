@@ -11,15 +11,19 @@
 
 namespace {
 
+// 桥接协议帧头：用于从串口字节流里定位一帧完整消息。
 constexpr uint8_t kBridgeSof0 = 0x55;
 constexpr uint8_t kBridgeSof1 = 0xAA;
+// 上位机可发起的命令类型。
 constexpr uint8_t kBridgeCmdPing = 0x01;
 constexpr uint8_t kBridgeCmdI2CRead = 0x10;
 constexpr uint8_t kBridgeCmdI2CWrite = 0x11;
 constexpr uint8_t kBridgeCmdSPIWrite = 0x20;
 constexpr uint8_t kBridgeCmdWS2812Frame = 0x21;
+// 板端主动推送使用的命令号。
 constexpr uint8_t kBridgeCmdIMUEulerPush = 0x30;
 constexpr uint8_t kBridgeCmdIMUDiagPush = 0x31;
+// 当前桥接只挑选这几个关键槽位上送给上位机。
 constexpr std::array<uint8_t, 4> kBridgeIMUPushIndexes = {
     static_cast<uint8_t>(Manager::ImuSlot::Forearm),
     static_cast<uint8_t>(Manager::ImuSlot::Hand),
@@ -75,6 +79,7 @@ ErrorCode IMUUartBridgeTask::Start() {
   const size_t required_heap = static_cast<size_t>(config_.stack_size) +
                                kTaskCreateOverheadBytes +
                                kTaskCreateSafetyBytes;
+  // 在真正建任务前先确认 FreeRTOS 剩余堆足够，避免启动阶段出现隐蔽内存问题。
   if (xPortGetFreeHeapSize() < required_heap) {
     return ErrorCode::NO_MEM;
   }
@@ -106,6 +111,7 @@ void IMUUartBridgeTask::TaskEntry(IMUUartBridgeTask* arg) {
 }
 
 void IMUUartBridgeTask::Run() {
+  // 同一个桥接任务支持两种模式：文本流模式和二进制桥接协议模式。
   if (config_.stream_relative_euler) {
     RunStreamMode();
   } else {
@@ -114,6 +120,7 @@ void IMUUartBridgeTask::Run() {
 }
 
 void IMUUartBridgeTask::RunStreamMode() {
+  // 文本模式只关心 imu_data 主题，并把第一个 IMU 的欧拉角输出成 CSV。
   imu_subscriber_ = new Topic::ASyncSubscriber<Manager::IMUArrayMsg>("imu_data");
   imu_subscriber_->StartWaiting();
   (void)WriteString("roll_deg,pitch_deg,yaw_deg\r\n");
@@ -136,6 +143,7 @@ void IMUUartBridgeTask::RunStreamMode() {
       }
       imu_subscriber_->StartWaiting();
     } else {
+      // 没有新数据时主动让出 CPU，避免桥接线程忙轮询。
       Thread::Sleep(1);
     }
   }
@@ -146,6 +154,7 @@ void IMUUartBridgeTask::RunStreamMode() {
 
 void IMUUartBridgeTask::RunBridgeMode() {
   if (config_.push_imu_euler_in_bridge) {
+    // 桥接模式下额外订阅 imu_data，用于主动向上位机推送 IMU 帧。
     imu_subscriber_ =
         new Topic::ASyncSubscriber<Manager::IMUArrayMsg>("imu_data");
     if (imu_subscriber_ != nullptr) {
@@ -155,6 +164,7 @@ void IMUUartBridgeTask::RunBridgeMode() {
   }
 
   while (running_) {
+    // 每轮先处理主动推送，再处理可能到来的上位机命令。
     PublishBridgeIMUData();
     PublishBridgeDiag();
 
@@ -176,6 +186,7 @@ void IMUUartBridgeTask::RunBridgeMode() {
 
     const uint16_t payload_len = static_cast<uint16_t>(hdr[3]) |
                                  (static_cast<uint16_t>(hdr[4]) << 8U);
+    // 头部解析完成后，交给统一命令分发器处理。
     HandleCommand(hdr[2], payload_len);
   }
 
@@ -217,6 +228,7 @@ bool IMUUartBridgeTask::ReadExact(uint8_t* buf, uint16_t len,
       return false;
     }
 
+    // 这里用“短睡眠 + 超时判断”的方式轮询串口缓冲，兼顾实时性和 CPU 占用。
     Thread::Sleep(1);
   }
 
@@ -224,6 +236,7 @@ bool IMUUartBridgeTask::ReadExact(uint8_t* buf, uint16_t len,
 }
 
 bool IMUUartBridgeTask::ReadChunked(uint8_t* buf, uint16_t len, uint8_t& sum) {
+  // 大负载按固定小块读取，避免一次读太多导致缓冲和超时处理都变得笨重。
   uint16_t offset = 0;
   while (offset < len) {
     const uint16_t chunk = static_cast<uint16_t>(
@@ -259,6 +272,7 @@ bool IMUUartBridgeTask::WriteExact(const uint8_t* buf, uint16_t len) {
 
   Semaphore sem(0);
   WriteOperation op(sem);
+  // 这里虽然接口看起来同步，但底层通常是 DMA + 中断完成通知。
   return uart_->Write({buf, len}, op) == ErrorCode::OK;
 }
 
@@ -293,6 +307,7 @@ void IMUUartBridgeTask::SendResponse(uint8_t cmd, const uint8_t* payload,
   frame[5 + len] = static_cast<uint8_t>(
       CalcSum(frame.data(), static_cast<uint16_t>(5 + len)));
 
+  // 统一按“帧头 + 命令 + 长度 + 负载 + 校验和”的格式回包。
   (void)WriteExact(frame.data(), static_cast<uint16_t>(6 + len));
 }
 
@@ -302,6 +317,7 @@ void IMUUartBridgeTask::HandleCommand(uint8_t cmd, uint16_t payload_len) {
                           static_cast<uint8_t>((payload_len >> 8U) & 0xFFU)};
   const uint8_t sum = CalcSum(hdr, sizeof(hdr));
 
+  // 根据命令字分派给不同硬件资源；未知命令则丢弃负载并返回错误状态。
   switch (cmd) {
     case kBridgeCmdPing:
       HandlePing(cmd, payload_len, sum);
@@ -376,6 +392,7 @@ void IMUUartBridgeTask::HandleI2CRead(uint8_t cmd, uint16_t payload_len,
     resp_len = static_cast<uint16_t>(1 + count * 2U);
     Semaphore sem(0);
     ReadOperation op(sem, config_.read_timeout_ms);
+    // 通过 IMUManager 统一仲裁 I2C，总线不会和后台采集线程发生冲突。
     const bool locked = imu_mgr_->AcquireBus();
     if (locked) {
       const auto ec = i2c_->MemRead(static_cast<uint16_t>(addr) << 1U, reg,
@@ -414,6 +431,7 @@ void IMUUartBridgeTask::HandleI2CWrite(uint8_t cmd, uint16_t payload_len,
   if (bus == config_.i2c_bus && addr == config_.imu_addr) {
     Semaphore sem(0);
     WriteOperation op(sem);
+    // 写寄存器前同样要先拿到 I2C 总线互斥权限。
     const bool locked = imu_mgr_->AcquireBus();
     if (locked) {
       const auto ec = i2c_->MemWrite(static_cast<uint16_t>(addr) << 1U, reg,
@@ -451,6 +469,7 @@ void IMUUartBridgeTask::HandleSPIWrite(uint8_t cmd, uint16_t payload_len,
   const auto tx_buf =
       (spi_ != nullptr) ? spi_->GetTxBuffer() : RawData(nullptr, 0);
   auto* tx_ptr = reinterpret_cast<uint8_t*>(tx_buf.addr_);
+  // 只有长度匹配且底层 SPI 发送缓冲足够时，才允许真正下发这帧数据。
   const bool frame_ok = (spi_len == data_len) && (tx_ptr != nullptr) &&
                         (spi_len <= tx_buf.size_);
 
@@ -493,6 +512,7 @@ void IMUUartBridgeTask::HandleWS2812Frame(uint8_t cmd, uint16_t payload_len,
   const auto tx_buf =
       (spi_ != nullptr) ? spi_->GetTxBuffer() : RawData(nullptr, 0);
   auto* tx_ptr = reinterpret_cast<uint8_t*>(tx_buf.addr_);
+  // 桥接层只负责收帧和校验，真正的长度匹配和灯带驱动由 manager / module 接力处理。
   const bool frame_ok = (tx_ptr != nullptr) && (rgb_len <= tx_buf.size_);
 
   if (frame_ok) {
@@ -530,6 +550,7 @@ void IMUUartBridgeTask::PublishBridgeIMUData() {
       ((now_ms - last_bridge_push_ms_) >= config_.stream_interval_ms);
 
   if (interval_ok) {
+    // 组帧时优先携带姿态、加速度、角速度和四元数，方便上位机一次拿到完整状态。
     std::array<uint8_t,
                1 + kBridgeIMUPushIndexes.size() * kBridgeIMUPushRecordSize>
         payload{};
@@ -542,6 +563,7 @@ void IMUUartBridgeTask::PublishBridgeIMUData() {
         continue;
       }
 
+      // 某个槽位没有数据时填 NaN，明确告诉上位机这个槽位当前无效。
       std::array<float, kBridgeIMUPushFloatCount> values{};
       values.fill(std::numeric_limits<float>::quiet_NaN());
       if (valid) {
@@ -572,6 +594,7 @@ void IMUUartBridgeTask::PublishBridgeIMUData() {
     }
   }
 
+  // 消费掉当前这帧消息后重新进入等待状态，准备接收下一次 Topic 发布。
   imu_subscriber_->StartWaiting();
 }
 
@@ -597,6 +620,7 @@ void IMUUartBridgeTask::PublishBridgeDiag() {
     }
   }
 
+  // 诊断帧主要用于让上位机快速了解采集序号、在线掩码、有效掩码和容量信息。
   std::array<uint8_t, 11> payload{};
   payload[0] = static_cast<uint8_t>(last_sequence_ & 0xFFU);
   payload[1] = static_cast<uint8_t>((last_sequence_ >> 8U) & 0xFFU);
@@ -621,6 +645,7 @@ bool IMUUartBridgeTask::ReadChecksum(uint8_t expected_sum) {
 }
 
 uint8_t IMUUartBridgeTask::CalcSum(const uint8_t* buf, uint16_t len) const {
+  // 当前桥接协议使用最简单的逐字节累加和，便于 MCU 和上位机两侧快速实现。
   uint8_t sum = 0;
   for (uint16_t i = 0; i < len; ++i) {
     sum = static_cast<uint8_t>(sum + buf[i]);

@@ -12,8 +12,15 @@
 
 namespace Module {
 
+/*
+ * Module: WitIMU
+ * - 这是对维特 JY901B / 同协议 IMU 的底层模块封装。
+ * - 它负责寄存器读写、原始寄存器缓存、量纲换算前的数据组织，以及校准相关控制命令。
+ * - Manager 层会在此基础上继续做多传感器管理、Topic 发布和总线互斥。
+ */
 class WitIMU {
  public:
+  // IMU 支持多种通信协议；当前工程实际使用的是 I2C 模式。
   enum class Protocol : uint8_t {
     NORMAL = 0,
     MODBUS = 1,
@@ -101,14 +108,19 @@ class WitIMU {
 
   using DataCallback = LibXR::Callback<>;
 
+  // 串口模式构造，保留给未来扩展；当前工程主要走 I2C 构造函数。
   WitIMU(LibXR::UART* uart, Protocol protocol = Protocol::NORMAL,
          uint8_t addr = 0x50);
+  // I2C 模式构造：addr 为 7bit 设备地址。
   explicit WitIMU(LibXR::I2C* i2c, uint8_t addr = 0x50);
 
+  // 初始化底层通信资源，确认当前模块可正常工作。
   ErrorCode Init();
   void DeInit();
+  // 拷贝当前解析后的 IMU 数据快照。
   void GetData(ImuData& data);
 
+  // 以下接口对应 IMU 的常见配置和校准命令。
   ErrorCode StartAccCalibration();
   ErrorCode StopAccCalibration();
   ErrorCode StartMagCalibration();
@@ -120,6 +132,7 @@ class WitIMU {
   ErrorCode SaveConfig();
   ErrorCode Reset();
 
+  // 读写寄存器与本地寄存器缓存同步。
   ErrorCode ReadReg(uint32_t reg, uint32_t count);
   void UpdateDataFromRegisters();
   ErrorCode WriteReg(uint32_t reg, uint16_t data);
@@ -145,6 +158,7 @@ class WitIMU {
   DataCallback* update_callback_ = nullptr;
   LibXR::Thread rx_thread_;
 
+  // 串口模式下使用的字节流解析辅助接口；当前 I2C 工程暂时未启用。
   void SerialDataIn(uint8_t data);
   void ProcessWitData(uint8_t index, uint16_t* data, uint32_t len);
   uint16_t CalculateCRC16(uint8_t* data, uint16_t len);
