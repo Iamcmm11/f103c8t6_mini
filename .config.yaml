@@ -9,7 +9,7 @@ Peripherals:
       Direction: SPI_DIRECTION_2LINES
       dma:
         dma_tx: &id003
-          request_id: '0'
+          request_id: '4'
           peripheral: SPI1_TX
           dma_type: DMA
           stream: DMA1_Channel3
@@ -29,7 +29,7 @@ Peripherals:
       Mode: Asynchronous
       dma:
         dma_rx: &id004
-          request_id: '4'
+          request_id: '3'
           peripheral: USART1_RX
           dma_type: DMA
           stream: DMA1_Channel5
@@ -41,7 +41,7 @@ Peripherals:
           mode: Normal
           priority: Low
         dma_tx: &id005
-          request_id: '3'
+          request_id: '2'
           peripheral: USART1_TX
           dma_type: DMA
           stream: DMA1_Channel4
@@ -66,7 +66,7 @@ Peripherals:
         SDA: PB7
       dma:
         dma_rx: &id001
-          request_id: '1'
+          request_id: '0'
           peripheral: I2C1_RX
           dma_type: DMA
           stream: DMA1_Channel7
@@ -76,9 +76,9 @@ Peripherals:
           periph_align: byte
           mem_align: byte
           mode: Normal
-          priority: Low
+          priority: High
         dma_tx: &id002
-          request_id: '2'
+          request_id: '1'
           peripheral: I2C1_TX
           dma_type: DMA
           stream: DMA1_Channel6
@@ -88,25 +88,25 @@ Peripherals:
           periph_align: byte
           mem_align: byte
           mode: Normal
-          priority: Low
+          priority: High
       DMA_RX: ENABLE
       DMA_RX_TYPE: DMA
       DMA_TX: ENABLE
       DMA_TX_TYPE: DMA
 DMA:
   Requests:
-    '0': SPI1_TX
-    '1': I2C1_RX
-    '2': I2C1_TX
-    '3': USART1_TX
-    '4': USART1_RX
+    '0': I2C1_RX
+    '1': I2C1_TX
+    '2': USART1_TX
+    '3': USART1_RX
+    '4': SPI1_TX
     sNb: '5'
   Configurations:
-    I2C1_RX_1: *id001
-    I2C1_TX_2: *id002
-    SPI1_TX_0: *id003
-    USART1_RX_4: *id004
-    USART1_TX_3: *id005
+    I2C1_RX_0: *id001
+    I2C1_TX_1: *id002
+    SPI1_TX_4: *id003
+    USART1_RX_3: *id004
+    USART1_TX_2: *id005
 Timebase:
   Source: TIM1
   IRQ: TIM1_UP_IRQn

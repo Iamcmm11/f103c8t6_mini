@@ -48,6 +48,7 @@ ErrorCode WS2812Strip::ShowRGB(const uint8_t* rgb, uint16_t led_count) {
   const uint16_t encoded_len =
       static_cast<uint16_t>(led_count * kEncodedBytesPerLed + kTotalResetBytes);
   return WriteEncoded(encoded_len);
+  // return ErrorCode::OK;
 }
 
 void WS2812Strip::EncodeByte(uint8_t byte, uint8_t* out) const {
@@ -118,9 +119,10 @@ ErrorCode WS2812Strip::WriteEncoded(uint16_t encoded_len) const {
   }
 
   Semaphore sem(0);
-  SPI::OperationRW op(sem);
+  SPI::OperationRW op(sem,20);
   // 对调用方而言这是一次“同步完成”的发送，但底层 SPI 往往会用 DMA/中断完成搬运。
   return spi_->Write({tx.addr_, encoded_len}, op);
+  // return ErrorCode::OK;
 }
 
 }  // namespace Module

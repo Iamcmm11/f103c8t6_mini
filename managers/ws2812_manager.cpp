@@ -47,6 +47,7 @@ ErrorCode WS2812Manager::ShowFrame(uint8_t spi_bus, const uint8_t* rgb,
 
   // 真正的编码与发送交给 Module 层处理。
   return strip_->ShowRGB(rgb, led_count);
+  // return ErrorCode::OK;
 }
 
 }  // namespace Manager

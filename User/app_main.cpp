@@ -112,8 +112,8 @@ extern "C" void app_main(void) {
 
   STM32SPI spi1(&hspi1, {nullptr, 0}, spi1_tx_buf, 3);
 
-  STM32UART uart5(&huart5,
-              {nullptr, 0}, {nullptr, 0}, 5);
+  // STM32UART uart5(&huart5,
+  //             {nullptr, 0}, {nullptr, 0}, 5);
 
   STM32UART usart1(&huart1,
               usart1_rx_buf, usart1_tx_buf, 5);
@@ -121,14 +121,6 @@ extern "C" void app_main(void) {
   STM32I2C i2c1(&hi2c1, i2c1_buf, 3);
 
   /* Terminal Configuration */
-  STDIO::read_ = usart1.read_port_;
-  STDIO::write_ = usart1.write_port_;
-
-  RamFS ramfs("XRobot");
-  Terminal<32, 32, 5, 5> terminal(ramfs);
-  auto terminal_task = Timer::CreateTask(terminal.TaskFun, &terminal, 10);
-  Timer::Add(terminal_task);
-  Timer::Start(terminal_task);
 
   // clang-format on
   // NOLINTEND
