@@ -2,21 +2,24 @@
 """
 Host-side tool for the STM32 UART bridge.
 
-docker exec -it my_realtime_container bash
+Run from repo root with utils/python path:
+  python utils/python/imu_uart_bridge_test.py --port COM4 ping
+  python utils/python/imu_uart_bridge_test.py --port COM4 rgb 135 206 250
+  python utils/python/imu_uart_bridge_test.py --port COM4 led 3 255 0 0
+  python utils/python/imu_uart_bridge_test.py --port COM4 off
+  python utils/python/imu_uart_bridge_test.py --port COM4 blink 135 206 250 --delay-ms 300
+  python utils/python/imu_uart_bridge_test.py --port COM4 led-blink 3 255 0 0 --delay-ms 300
+  python utils/python/imu_uart_bridge_test.py --port COM4 console
 
-Raw serial monitor:
-  python3 -m serial.tools.miniterm /dev/ttyTCU0 115200
+Run from repo root with scripts path:
+  python scripts/imu_uart_bridge_test.py --port COM4 ping
+  python scripts/imu_uart_bridge_test.py --port COM4 rgb 135 206 250
+  python scripts/imu_uart_bridge_test.py --port COM4 led 3 255 0 0
+  python scripts/imu_uart_bridge_test.py --port COM4 off
+  python scripts/imu_uart_bridge_test.py --port COM4 blink 135 206 250 --delay-ms 300
+  python scripts/imu_uart_bridge_test.py --port COM4 led-blink 3 255 0 0 --delay-ms 300
+  python scripts/imu_uart_bridge_test.py --port COM4 console
 
-Continuous IMU monitor:
-  python3 /tmp/imu_uart_bridge_test.py --port /dev/ttyTCU0 console
-  python utils/python/imu_uart_bridge_test.py --port COM4 console 
-Examples:
-  python3 scripts/imu_uart_bridge_test.py --port /dev/ttyTCU0 ping
-  python3 /tmp/imu_uart_bridge_test.py --port /dev/ttyTCU0 rgb 135 206 250
-  python3 /tmp/imu_uart_bridge_test.py --port /dev/ttyTCU0 led 3 255 0 0
-  python3 /tmp/imu_uart_bridge_test.py --port /dev/ttyTCU0 off
-  python3 /tmp/imu_uart_bridge_test.py --port /dev/ttyTCU0 blink 135 206 250
-  python3 /tmp/imu_uart_bridge_test.py --port /dev/ttyTCU0 console
 """ 
 
 from __future__ import annotations
@@ -49,13 +52,16 @@ SOF0 = 0x55
 SOF1 = 0xAA
 
 CMD_PING = 0x01
-CMD_WS2812_FRAME = 0x21
+CMD_WS2812_CONTROL = 0x21
 CMD_IMU_EULER_PUSH = 0x30
 CMD_IMU_DIAG_PUSH = 0x31
 
 STATUS_OK = 0
-DEFAULT_SPI_BUS = 0
-DEFAULT_LED_COUNT = 16
+DEFAULT_LED_COUNT = 21
+TARGET_ALL_LEDS = 0xFF
+FLAG_BLINK_ENABLE = 0x01
+MIN_BLINK_INTERVAL_MS = 20
+MAX_BLINK_INTERVAL_MS = 0xFFFF
 MAX_FRAME_PAYLOAD = 1024
 IMU_PUSH_LEGACY_RECORD_SIZE = struct.calcsize("<Bfff")
 IMU_PUSH_EXTENDED_FLOAT_COUNT = 13
@@ -119,24 +125,59 @@ def parse_byte(text: str) -> int:
     return value
 
 
-def make_solid_frame(led_count: int, red: int, green: int, blue: int) -> bytes:
-    return bytes([red, green, blue]) * led_count
-
-
-def make_single_led_frame(
-    led_count: int, led_index: int, red: int, green: int, blue: int
-) -> bytes:
-    if led_index < 0 or led_index >= led_count:
-        raise ValueError(
-            f"led index out of range: {led_index}, valid range is 0..{led_count - 1}"
+def parse_led_index(text: str) -> int:
+    value = int(text, 0)
+    if value < 0 or value >= DEFAULT_LED_COUNT:
+        raise argparse.ArgumentTypeError(
+            f"LED index out of range: {text}, valid range is 0..{DEFAULT_LED_COUNT - 1}"
         )
+    return value
 
-    frame = bytearray(led_count * 3)
-    base = led_index * 3
-    frame[base] = red
-    frame[base + 1] = green
-    frame[base + 2] = blue
-    return bytes(frame)
+
+def parse_interval_ms(text: str) -> int:
+    value = int(float(text))
+    if value < MIN_BLINK_INTERVAL_MS or value > MAX_BLINK_INTERVAL_MS:
+        raise argparse.ArgumentTypeError(
+            f"blink interval out of range: {text}, valid range is "
+            f"{MIN_BLINK_INTERVAL_MS}..{MAX_BLINK_INTERVAL_MS} ms"
+        )
+    return value
+
+
+def parse_console_delay_ms(
+    tokens: list[str],
+    delay_index: int,
+    default_ms: int,
+    usage: str,
+) -> int:
+    if len(tokens) == delay_index:
+        return default_ms
+    if len(tokens) == delay_index + 1:
+        return parse_interval_ms(tokens[delay_index])
+    if len(tokens) == delay_index + 2 and tokens[delay_index] == "--delay-ms":
+        return parse_interval_ms(tokens[delay_index + 1])
+    raise ValueError(f"usage: {usage}")
+
+
+def build_light_control_payload(
+    target: int,
+    red: int,
+    green: int,
+    blue: int,
+    *,
+    blink_enable: bool,
+    interval_ms: int = 0,
+) -> bytes:
+    flags = FLAG_BLINK_ENABLE if blink_enable else 0
+    return struct.pack(
+        "<BBBBBH",
+        target & 0xFF,
+        flags,
+        red & 0xFF,
+        green & 0xFF,
+        blue & 0xFF,
+        interval_ms & 0xFFFF,
+    )
 
 
 def format_addr_with_color(addr: int) -> str:
@@ -178,7 +219,7 @@ class BridgeClient:
         self._last_imu_line_len = 0
         self._response_queues = {
             CMD_PING: queue.Queue(),
-            CMD_WS2812_FRAME: queue.Queue(),
+            CMD_WS2812_CONTROL: queue.Queue(),
         }
 
     def set_imu_record_callback(
@@ -545,86 +586,64 @@ class BridgeClient:
         )
 
 
-class BlinkWorker:
-    def __init__(self, client: BridgeClient, spi_bus: int, led_count: int) -> None:
-        self._client = client
-        self._spi_bus = spi_bus
-        self._led_count = led_count
-        self._thread: Optional[threading.Thread] = None
-        self._stop_event = threading.Event()
-
-    def start(self, red: int, green: int, blue: int, delay_ms: float) -> None:
-        self.stop(turn_off=False)
-        self._stop_event.clear()
-        self._thread = threading.Thread(
-            target=self._run, args=(red, green, blue, delay_ms), daemon=True
-        )
-        self._thread.start()
-
-    def stop(self, *, turn_off: bool = True) -> None:
-        self._stop_event.set()
-        if self._thread is not None:
-            self._thread.join(timeout=1.0)
-            self._thread = None
-
-        if turn_off:
-            send_ws2812_checked(
-                self._client, self._spi_bus, make_solid_frame(self._led_count, 0, 0, 0)
-            )
-
-    def _run(self, red: int, green: int, blue: int, delay_ms: float) -> None:
-        on = True
-        while not self._stop_event.is_set():
-            frame = (
-                make_solid_frame(self._led_count, red, green, blue)
-                if on
-                else make_solid_frame(self._led_count, 0, 0, 0)
-            )
-            try:
-                send_ws2812_checked(self._client, self._spi_bus, frame)
-            except TimeoutError as exc:
-                print(f"[bridge] blink timeout: {exc}", file=sys.stderr, flush=True)
-            except Exception as exc:
-                print(f"[bridge] blink error: {exc}", file=sys.stderr, flush=True)
-            on = not on
-            self._stop_event.wait(delay_ms / 1000.0)
-
-
 def send_ping(client: BridgeClient) -> None:
     payload = client.request(CMD_PING, b"")
     if len(payload) != 1 or payload[0] != STATUS_OK:
         raise RuntimeError(f"ping failed, payload={payload.hex(' ')}")
 
 
-def send_ws2812_frame(client: BridgeClient, spi_bus: int, rgb: bytes) -> int:
-    if len(rgb) % 3 != 0:
-        raise ValueError(f"RGB payload length must be a multiple of 3, got {len(rgb)}")
-
-    led_count = len(rgb) // 3
-    payload = bytes(
-        [
-            spi_bus & 0xFF,
-            led_count & 0xFF,
-            (led_count >> 8) & 0xFF,
-        ]
-    ) + rgb
-
+def send_light_control(
+    client: BridgeClient,
+    target: int,
+    red: int,
+    green: int,
+    blue: int,
+    *,
+    blink_enable: bool = False,
+    interval_ms: int = 0,
+) -> int:
+    payload = build_light_control_payload(
+        target,
+        red,
+        green,
+        blue,
+        blink_enable=blink_enable,
+        interval_ms=interval_ms,
+    )
     try:
-        resp = client.request(CMD_WS2812_FRAME, payload, timeout=1.5)
+        resp = client.request(CMD_WS2812_CONTROL, payload, timeout=1.5)
     except TimeoutError:
         # Under heavy IMU push traffic, retry once to tolerate transient response delay.
         time.sleep(0.02)
-        resp = client.request(CMD_WS2812_FRAME, payload, timeout=1.5)
+        resp = client.request(CMD_WS2812_CONTROL, payload, timeout=1.5)
     if len(resp) != 1:
-        raise RuntimeError(f"unexpected WS2812 response length: {len(resp)}")
+        raise RuntimeError(f"unexpected light-control response length: {len(resp)}")
     return resp[0]
 
 
-def send_ws2812_checked(client: BridgeClient, spi_bus: int, rgb: bytes) -> None:
-    status = send_ws2812_frame(client, spi_bus, rgb)
+def send_light_control_checked(
+    client: BridgeClient,
+    target: int,
+    red: int,
+    green: int,
+    blue: int,
+    *,
+    blink_enable: bool = False,
+    interval_ms: int = 0,
+) -> None:
+    status = send_light_control(
+        client,
+        target,
+        red,
+        green,
+        blue,
+        blink_enable=blink_enable,
+        interval_ms=interval_ms,
+    )
     if status != STATUS_OK:
         raise RuntimeError(
-            f"WS2812 bridge returned error status={status}, spi_bus={spi_bus}, led_count={len(rgb) // 3}"
+            f"light-control returned error status={status}, target=0x{target:02X}, "
+            f"blink={blink_enable}, interval_ms={interval_ms}"
         )
 
 
@@ -635,130 +654,161 @@ def cmd_ping(client: BridgeClient, _args: argparse.Namespace) -> int:
 
 
 def cmd_off(client: BridgeClient, args: argparse.Namespace) -> int:
-    send_ws2812_checked(client, args.spi_bus, make_solid_frame(args.led_count, 0, 0, 0))
-    print(f"OFF ok, spi_bus={args.spi_bus}, led_count={args.led_count}")
+    send_light_control_checked(client, TARGET_ALL_LEDS, 0, 0, 0)
+    print(f"OFF ok, led_count={DEFAULT_LED_COUNT}")
     return 0
 
 
 def cmd_rgb(client: BridgeClient, args: argparse.Namespace) -> int:
-    send_ws2812_checked(
-        client,
-        args.spi_bus,
-        make_solid_frame(args.led_count, args.red, args.green, args.blue),
-    )
+    send_light_control_checked(client, TARGET_ALL_LEDS, args.red, args.green, args.blue)
     print(
-        f"RGB ok, spi_bus={args.spi_bus}, led_count={args.led_count}, "
+        f"RGB ok, led_count={DEFAULT_LED_COUNT}, "
         f"rgb=({args.red},{args.green},{args.blue})"
     )
     return 0
 
 
 def cmd_led(client: BridgeClient, args: argparse.Namespace) -> int:
-    send_ws2812_checked(
+    send_light_control_checked(
         client,
-        args.spi_bus,
-        make_single_led_frame(
-            args.led_count, args.index, args.red, args.green, args.blue
-        ),
+        args.index,
+        args.red,
+        args.green,
+        args.blue,
     )
     print(
-        f"LED ok, spi_bus={args.spi_bus}, led_count={args.led_count}, "
-        f"index={args.index}, rgb=({args.red},{args.green},{args.blue})"
+        f"LED ok, index={args.index}, rgb=({args.red},{args.green},{args.blue})"
     )
     return 0
 
 
 def cmd_blink(client: BridgeClient, args: argparse.Namespace) -> int:
-    print("Running blink, IMU push will continue printing, press Ctrl+C to stop...")
-    on = True
-    try:
-        while True:
-            frame = (
-                make_solid_frame(args.led_count, args.red, args.green, args.blue)
-                if on
-                else make_solid_frame(args.led_count, 0, 0, 0)
-            )
-            send_ws2812_checked(client, args.spi_bus, frame)
-            on = not on
-            time.sleep(args.delay_ms / 1000.0)
-    finally:
-        send_ws2812_checked(client, args.spi_bus, make_solid_frame(args.led_count, 0, 0, 0))
+    send_light_control_checked(
+        client,
+        TARGET_ALL_LEDS,
+        args.red,
+        args.green,
+        args.blue,
+        blink_enable=True,
+        interval_ms=args.delay_ms,
+    )
+    print(
+        f"BLINK ok, led_count={DEFAULT_LED_COUNT}, "
+        f"rgb=({args.red},{args.green},{args.blue}), delay_ms={args.delay_ms}"
+    )
+    return 0
+
+
+def cmd_led_blink(client: BridgeClient, args: argparse.Namespace) -> int:
+    send_light_control_checked(
+        client,
+        args.index,
+        args.red,
+        args.green,
+        args.blue,
+        blink_enable=True,
+        interval_ms=args.delay_ms,
+    )
+    print(
+        f"LED-BLINK ok, index={args.index}, "
+        f"rgb=({args.red},{args.green},{args.blue}), delay_ms={args.delay_ms}"
+    )
+    return 0
 
 
 def cmd_console(client: BridgeClient, args: argparse.Namespace) -> int:
-    blink_worker = BlinkWorker(client, args.spi_bus, args.led_count)
     print("Console mode started. IMU push will print automatically.")
     print(
         "Commands: ping | off | rgb R G B | led I R G B | "
-        "blink R G B [delay_ms] | stop | quit"
+        "blink R G B [delay_ms|--delay-ms N] | "
+        "led-blink I R G B [delay_ms|--delay-ms N] | stop | quit"
     )
 
-    try:
-        while True:
-            try:
-                line = input("> ").strip()
-            except EOFError:
+    while True:
+        try:
+            line = input("> ").strip()
+        except EOFError:
+            break
+
+        if not line:
+            continue
+
+        tokens = line.split()
+        cmd = tokens[0].lower()
+
+        try:
+            if cmd in {"quit", "exit"}:
                 break
-
-            if not line:
-                continue
-
-            tokens = line.split()
-            cmd = tokens[0].lower()
-
-            try:
-                if cmd in {"quit", "exit"}:
-                    break
-                if cmd == "ping":
-                    send_ping(client)
-                    print("PING ok")
-                elif cmd == "off":
-                    blink_worker.stop(turn_off=False)
-                    send_ws2812_checked(
-                        client, args.spi_bus, make_solid_frame(args.led_count, 0, 0, 0)
-                    )
-                    print("OFF ok")
-                elif cmd == "rgb" and len(tokens) == 4:
-                    blink_worker.stop(turn_off=False)
-                    red = parse_byte(tokens[1])
-                    green = parse_byte(tokens[2])
-                    blue = parse_byte(tokens[3])
-                    send_ws2812_checked(
-                        client,
-                        args.spi_bus,
-                        make_solid_frame(args.led_count, red, green, blue),
-                    )
-                    print(f"RGB ok: ({red},{green},{blue})")
-                elif cmd == "led" and len(tokens) == 5:
-                    blink_worker.stop(turn_off=False)
-                    index = int(tokens[1], 0)
-                    red = parse_byte(tokens[2])
-                    green = parse_byte(tokens[3])
-                    blue = parse_byte(tokens[4])
-                    send_ws2812_checked(
-                        client,
-                        args.spi_bus,
-                        make_single_led_frame(
-                            args.led_count, index, red, green, blue
-                        ),
-                    )
-                    print(f"LED ok: index={index}, rgb=({red},{green},{blue})")
-                elif cmd == "blink" and len(tokens) in {4, 5}:
-                    red = parse_byte(tokens[1])
-                    green = parse_byte(tokens[2])
-                    blue = parse_byte(tokens[3])
-                    delay_ms = float(tokens[4]) if len(tokens) == 5 else 300.0
-                    blink_worker.start(red, green, blue, delay_ms)
-                    print(f"BLINK started: ({red},{green},{blue}), delay_ms={delay_ms}")
-                elif cmd == "stop":
-                    blink_worker.stop()
-                    print("BLINK stopped")
-                else:
-                    print("Unknown command")
-            except Exception as exc:
-                print(f"command error: {exc}", file=sys.stderr)
-    finally:
-        blink_worker.stop()
+            if cmd == "ping":
+                send_ping(client)
+                print("PING ok")
+            elif cmd == "off":
+                send_light_control_checked(client, TARGET_ALL_LEDS, 0, 0, 0)
+                print("OFF ok")
+            elif cmd == "rgb" and len(tokens) == 4:
+                red = parse_byte(tokens[1])
+                green = parse_byte(tokens[2])
+                blue = parse_byte(tokens[3])
+                send_light_control_checked(client, TARGET_ALL_LEDS, red, green, blue)
+                print(f"RGB ok: ({red},{green},{blue})")
+            elif cmd == "led" and len(tokens) == 5:
+                index = parse_led_index(tokens[1])
+                red = parse_byte(tokens[2])
+                green = parse_byte(tokens[3])
+                blue = parse_byte(tokens[4])
+                send_light_control_checked(client, index, red, green, blue)
+                print(f"LED ok: index={index}, rgb=({red},{green},{blue})")
+            elif cmd == "blink":
+                red = parse_byte(tokens[1])
+                green = parse_byte(tokens[2])
+                blue = parse_byte(tokens[3])
+                delay_ms = parse_console_delay_ms(
+                    tokens,
+                    4,
+                    300,
+                    "blink R G B [delay_ms|--delay-ms N]",
+                )
+                send_light_control_checked(
+                    client,
+                    TARGET_ALL_LEDS,
+                    red,
+                    green,
+                    blue,
+                    blink_enable=True,
+                    interval_ms=delay_ms,
+                )
+                print(f"BLINK ok: ({red},{green},{blue}), delay_ms={delay_ms}")
+            elif cmd == "led-blink":
+                index = parse_led_index(tokens[1])
+                red = parse_byte(tokens[2])
+                green = parse_byte(tokens[3])
+                blue = parse_byte(tokens[4])
+                delay_ms = parse_console_delay_ms(
+                    tokens,
+                    5,
+                    300,
+                    "led-blink I R G B [delay_ms|--delay-ms N]",
+                )
+                send_light_control_checked(
+                    client,
+                    index,
+                    red,
+                    green,
+                    blue,
+                    blink_enable=True,
+                    interval_ms=delay_ms,
+                )
+                print(
+                    f"LED-BLINK ok: index={index}, "
+                    f"rgb=({red},{green},{blue}), delay_ms={delay_ms}"
+                )
+            elif cmd == "stop":
+                send_light_control_checked(client, TARGET_ALL_LEDS, 0, 0, 0)
+                print("STOP ok")
+            else:
+                print("Unknown command")
+        except Exception as exc:
+            print(f"command error: {exc}", file=sys.stderr)
 
     return 0
 
@@ -873,18 +923,6 @@ def cmd_capture(client: BridgeClient, args: argparse.Namespace) -> int:
     return 0
 
 
-def add_ws_common_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument(
-        "--spi-bus", type=lambda x: int(x, 0), default=DEFAULT_SPI_BUS, help="SPI bus id"
-    )
-    parser.add_argument(
-        "--led-count",
-        type=lambda x: int(x, 0),
-        default=DEFAULT_LED_COUNT,
-        help=f"number of LEDs (default: {DEFAULT_LED_COUNT})",
-    )
-
-
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="UART bridge tool for IMU push and WS2812 control")
     parser.add_argument("--port", required=True, help="serial port, e.g. COM12 or /dev/ttyUSB0")
@@ -903,41 +941,54 @@ def build_parser() -> argparse.ArgumentParser:
     ping_parser.set_defaults(func=cmd_ping)
 
     off_parser = subparsers.add_parser("off", help="turn off all WS2812 LEDs")
-    add_ws_common_args(off_parser)
     off_parser.set_defaults(func=cmd_off)
 
     rgb_parser = subparsers.add_parser("rgb", help="set all LEDs to one RGB color")
-    add_ws_common_args(rgb_parser)
     rgb_parser.add_argument("red", type=parse_byte, help="red 0-255")
     rgb_parser.add_argument("green", type=parse_byte, help="green 0-255")
     rgb_parser.add_argument("blue", type=parse_byte, help="blue 0-255")
     rgb_parser.set_defaults(func=cmd_rgb)
 
     led_parser = subparsers.add_parser(
-        "led", help="set one LED by index, turn all others off"
+        "led", help="set one LED by index, keeping other LEDs unchanged"
     )
-    add_ws_common_args(led_parser)
-    led_parser.add_argument("index", type=int, help="LED index, 0-based")
+    led_parser.add_argument("index", type=parse_led_index, help="LED index, 0-based")
     led_parser.add_argument("red", type=parse_byte, help="red 0-255")
     led_parser.add_argument("green", type=parse_byte, help="green 0-255")
     led_parser.add_argument("blue", type=parse_byte, help="blue 0-255")
     led_parser.set_defaults(func=cmd_led)
 
-    blink_parser = subparsers.add_parser("blink", help="blink one RGB color")
-    add_ws_common_args(blink_parser)
+    blink_parser = subparsers.add_parser("blink", help="blink all LEDs with one RGB color")
     blink_parser.add_argument("red", type=parse_byte, help="red 0-255")
     blink_parser.add_argument("green", type=parse_byte, help="green 0-255")
     blink_parser.add_argument("blue", type=parse_byte, help="blue 0-255")
     blink_parser.add_argument(
-        "--delay-ms", type=float, default=300.0, help="toggle interval in milliseconds"
+        "--delay-ms",
+        type=parse_interval_ms,
+        default=300,
+        help="toggle interval in milliseconds",
     )
     blink_parser.set_defaults(func=cmd_blink)
 
+    led_blink_parser = subparsers.add_parser(
+        "led-blink", help="blink one LED by index, keeping other LEDs unchanged"
+    )
+    led_blink_parser.add_argument("index", type=parse_led_index, help="LED index, 0-based")
+    led_blink_parser.add_argument("red", type=parse_byte, help="red 0-255")
+    led_blink_parser.add_argument("green", type=parse_byte, help="green 0-255")
+    led_blink_parser.add_argument("blue", type=parse_byte, help="blue 0-255")
+    led_blink_parser.add_argument(
+        "--delay-ms",
+        type=parse_interval_ms,
+        default=300,
+        help="toggle interval in milliseconds",
+    )
+    led_blink_parser.set_defaults(func=cmd_led_blink)
+
     console_parser = subparsers.add_parser(
         "console",
-        help="keep receiving IMU push while typing ping/off/rgb/blink commands",
+        help="keep receiving IMU push while typing ping/off/rgb/led/blink commands",
     )
-    add_ws_common_args(console_parser)
     console_parser.set_defaults(func=cmd_console)
 
     monitor_parser = subparsers.add_parser(

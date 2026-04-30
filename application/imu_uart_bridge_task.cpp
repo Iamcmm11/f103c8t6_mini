@@ -19,7 +19,7 @@ constexpr uint8_t kBridgeCmdPing = 0x01;
 constexpr uint8_t kBridgeCmdI2CRead = 0x10;
 constexpr uint8_t kBridgeCmdI2CWrite = 0x11;
 constexpr uint8_t kBridgeCmdSPIWrite = 0x20;
-constexpr uint8_t kBridgeCmdWS2812Frame = 0x21;
+constexpr uint8_t kBridgeCmdWS2812Control = 0x21;
 // 板端主动推送使用的命令号。
 constexpr uint8_t kBridgeCmdIMUEulerPush = 0x30;
 constexpr uint8_t kBridgeCmdIMUDiagPush = 0x31;
@@ -331,8 +331,8 @@ void IMUUartBridgeTask::HandleCommand(uint8_t cmd, uint16_t payload_len) {
     case kBridgeCmdSPIWrite:
       HandleSPIWrite(cmd, payload_len, sum);
       return;
-    case kBridgeCmdWS2812Frame:
-      HandleWS2812Frame(cmd, payload_len, sum);
+    case kBridgeCmdWS2812Control:
+      HandleWS2812Control(cmd, payload_len, sum);
       return;
     default: {
       uint8_t frame_sum = sum;
@@ -489,44 +489,32 @@ void IMUUartBridgeTask::HandleSPIWrite(uint8_t cmd, uint16_t payload_len,
   SendResponse(cmd, &resp, 1);
 }
 
-void IMUUartBridgeTask::HandleWS2812Frame(uint8_t cmd, uint16_t payload_len,
-                                          uint8_t sum) {
-  uint8_t meta[3] = {0};
+void IMUUartBridgeTask::HandleWS2812Control(uint8_t cmd, uint16_t payload_len,
+                                            uint8_t sum) {
+  uint8_t payload[7] = {0};
   uint8_t resp = kBridgeStatusError;
 
-  if (payload_len < sizeof(meta)) {
+  if (payload_len != sizeof(payload)) {
     if (!DiscardChunked(payload_len, sum) || !ReadChecksum(sum)) {
       return;
     }
     SendResponse(cmd, &resp, 1);
     return;
   }
-  if (!ReadChunked(meta, sizeof(meta), sum)) {
+  if (!ReadChunked(payload, sizeof(payload), sum) || !ReadChecksum(sum)) {
     return;
   }
 
-  const uint16_t led_count = static_cast<uint16_t>(meta[1]) |
-                             (static_cast<uint16_t>(meta[2]) << 8U);
-  const uint16_t rgb_len = static_cast<uint16_t>(payload_len - sizeof(meta));
+  const uint8_t target = payload[0];
+  const uint8_t flags = payload[1];
+  const bool blink_enable = (flags & 0x01U) != 0U;
+  const uint16_t interval_ms = static_cast<uint16_t>(payload[5]) |
+                               (static_cast<uint16_t>(payload[6]) << 8U);
+  const bool flags_ok = (flags & 0xFEU) == 0U;
 
-  const auto tx_buf =
-      (spi_ != nullptr) ? spi_->GetTxBuffer() : RawData(nullptr, 0);
-  auto* tx_ptr = reinterpret_cast<uint8_t*>(tx_buf.addr_);
-  // 桥接层只负责收帧和校验，真正的长度匹配和灯带驱动由 manager / module 接力处理。
-  const bool frame_ok = (tx_ptr != nullptr) && (rgb_len <= tx_buf.size_);
-
-  if (frame_ok) {
-    if (!ReadChunked(tx_ptr, rgb_len, sum) || !ReadChecksum(sum)) {
-      return;
-    }
-  } else {
-    if (!DiscardChunked(rgb_len, sum) || !ReadChecksum(sum)) {
-      return;
-    }
-  }
-
-  if (frame_ok && ws2812_mgr_ != nullptr &&
-      ws2812_mgr_->ShowFrame(meta[0], tx_ptr, rgb_len, led_count) ==
+  if (flags_ok && ws2812_mgr_ != nullptr &&
+      ws2812_mgr_->SetLightControl(target, payload[2], payload[3], payload[4],
+                                   blink_enable, interval_ms) ==
           ErrorCode::OK) {
     resp = kBridgeStatusOk;
   }

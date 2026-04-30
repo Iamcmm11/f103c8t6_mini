@@ -68,7 +68,7 @@ class IMUUartBridgeTask {
   void HandleI2CRead(uint8_t cmd, uint16_t payload_len, uint8_t sum);
   void HandleI2CWrite(uint8_t cmd, uint16_t payload_len, uint8_t sum);
   void HandleSPIWrite(uint8_t cmd, uint16_t payload_len, uint8_t sum);
-  void HandleWS2812Frame(uint8_t cmd, uint16_t payload_len, uint8_t sum);
+  void HandleWS2812Control(uint8_t cmd, uint16_t payload_len, uint8_t sum);
 
   // 主动推送能力：IMU 数据推送与诊断推送。
   void PublishBridgeIMUData();

@@ -42,6 +42,7 @@ namespace {
  */
 constexpr bool kEnableUart5PlaintextDiag = false;
 constexpr bool kEnableUart5BootLog = true;
+constexpr uint16_t kWS2812LedCount = 16;
 
 // 通过 HAL 直接向 UART5 发送字符串，适合上电阶段做简单阻塞日志输出。
 void Uart5Print(const char* text) {
@@ -134,7 +135,8 @@ extern "C" void app_main(void) {
   static ::Module::WS2812Strip ws2812_strip(&spi1);
   static ::Manager::WS2812Manager ws2812_manager;
   const auto ws2812_ec =
-      ws2812_manager.Init(&ws2812_strip, 0);  // 0 表示当前灯带挂在逻辑 spi_bus 0 上。
+      ws2812_manager.Init(&ws2812_strip, 0,
+                          kWS2812LedCount);  // 0 表示当前灯带挂在逻辑 spi_bus 0 上。
 
   /*
    * Manager: IMU
