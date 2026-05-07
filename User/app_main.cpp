@@ -43,6 +43,7 @@ namespace {
 constexpr bool kEnableUart5PlaintextDiag = false;
 constexpr bool kEnableUart5BootLog = true;
 constexpr uint16_t kWS2812LedCount = 16;
+constexpr uint32_t kImuAcquisitionHz = 200;
 // 默认四元数输出源，改这里就能在 VQF / ImuRaw 原生四元数之间切换。
 constexpr ::Manager::QuaternionSource kDefaultQuaternionSource = ::Manager::QuaternionSource::VQF;
 
@@ -141,11 +142,15 @@ extern "C" void app_main(void) {
    * - IMUManager 负责 IMU 设备探测、I2C 总线互斥、周期采集和 Topic 数据发布。
    * - ACTUAL_IMU_COUNT 表示当前工程实际启用的 IMU 槽位数量。
    * - 四元数默认输出源也在这里统一设置，方便后续直接改 app_main 做切换。
-   */
+  */
   static ::Manager::IMUManager imu_manager(::Manager::ACTUAL_IMU_COUNT);
-  const auto imu_init_ec = imu_manager.Init(&i2c1, ::Manager::kDefaultImuAddress);
+  const auto imu_init_ec =
+      imu_manager.Init(&i2c1, ::Manager::kDefaultImuAddress);
   imu_manager.SetQuaternionSource(kDefaultQuaternionSource);
-  const auto imu_acq_ec = imu_manager.StartAcquisition(50, "imu_data");
+  ErrorCode imu_acq_ec = ErrorCode::INIT_ERR;
+  if (imu_init_ec == ErrorCode::OK) {
+    imu_acq_ec = imu_manager.StartAcquisition(kImuAcquisitionHz, "imu_data");
+  }
 
   /*
    * Boot Log
@@ -201,18 +206,23 @@ extern "C" void app_main(void) {
    */
   static ::Application::IMUUartBridgeConfig bridge_config;
   bridge_config.stream_relative_euler = false;
-  bridge_config.push_imu_euler_in_bridge = true;
+  bridge_config.push_imu_euler_in_bridge = (imu_acq_ec == ErrorCode::OK);
   bridge_config.stream_interval_ms = 20;
   bridge_config.stack_size = 2048;
 
   // 把 USART1 / I2C1 / SPI1 / IMUManager / WS2812Manager 注入到应用层桥接任务。
   static ::Application::IMUUartBridgeTask imu_bridge(
       &usart1, &i2c1, &spi1, &imu_manager, &ws2812_manager, bridge_config);
-  (void)imu_bridge.Start();
+  const auto bridge_start_ec = imu_bridge.Start();
 
   // 这里表示桥接任务已经完成启动请求，后续可通过 USART1 进入桥接交互。
   if (kEnableUart5BootLog) {
-    Uart5PrintLine("[boot] USART1 bridge ready");
+    char line[128] = {0};
+    std::snprintf(line, sizeof(line),
+                  "[boot] bridge_start=%d push_imu=%u",
+                  static_cast<int>(bridge_start_ec),
+                  static_cast<unsigned>(bridge_config.push_imu_euler_in_bridge));
+    Uart5PrintLine(line);
   }
 
   /*

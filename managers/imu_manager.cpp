@@ -24,6 +24,7 @@ constexpr uint32_t kInitBootDelayMs = 120;
 // 初始化阶段允许有限次重试，降低刚上电时的偶发探测失败。
 constexpr uint32_t kInitProbeRetryCount = 5;
 constexpr uint32_t kInitProbeRetryDelayMs = 25;
+constexpr Module::WitIMU::OutputRate kImuOutputRate = Module::WitIMU::OutputRate::RATE_200HZ;
 // IMU 采集线程自己的栈，和 defaultTask / bridge task 的栈彼此独立。
 constexpr uint32_t kAcquisitionStackBytes = 2048;
 constexpr uint32_t kTaskCreateOverheadBytes = 384;
@@ -71,7 +72,32 @@ ErrorCode IMUManager::Init(I2C* i2c, uint8_t base_address) {
 
   Thread::Sleep(kInitBootDelayMs);
 
-  uint8_t success_count = 0;
+  auto probe_all = [this]() {
+    uint8_t success_count = 0;
+    online_mask_ = 0;
+    for (uint8_t i = 0; i < imu_count_; ++i) {
+      if (imus_[i] == nullptr) {
+        continue;
+      }
+
+      bool online = false;
+      for (uint32_t attempt = 0; attempt < kInitProbeRetryCount; ++attempt) {
+        if (ProbeIMU(i)) {
+          online = true;
+          break;
+        }
+        if ((attempt + 1U) < kInitProbeRetryCount) {
+          Thread::Sleep(kInitProbeRetryDelayMs);
+        }
+      }
+
+      if (online) {
+        ++success_count;
+      }
+    }
+    return success_count;
+  };
+
   for (uint8_t i = 0; i < imu_count_; ++i) {
     delete imus_[i];
     imus_[i] = new Module::WitIMU(i2c_, ResolveImuI2CAddress(i, base_address_));
@@ -82,23 +108,19 @@ ErrorCode IMUManager::Init(I2C* i2c, uint8_t base_address) {
     if (imus_[i]->Init() != Module::WitIMU::ErrorCode::OK) {
       continue;
     }
-
-    bool online = false;
-    for (uint32_t attempt = 0; attempt < kInitProbeRetryCount; ++attempt) {
-      if (ProbeIMU(i)) {
-        online = true;
-        break;
-      }
-      if ((attempt + 1U) < kInitProbeRetryCount) {
-        Thread::Sleep(kInitProbeRetryDelayMs);
-      }
-    }
-
-    if (online) {
-      ++success_count;
-    }
   }
 
+  uint8_t success_count = probe_all();
+  if (success_count > 0) {
+    return ErrorCode::OK;
+  }
+
+  if (i2c_->RecoverBus() != ErrorCode::OK) {
+    return ErrorCode::INIT_ERR;
+  }
+
+  Thread::Sleep(kInitBootDelayMs);
+  success_count = probe_all();
   return (success_count > 0) ? ErrorCode::OK : ErrorCode::INIT_ERR;
 }
 
@@ -369,6 +391,7 @@ bool IMUManager::ProbeIMU(uint8_t index) {
   }
 
   online_mask_ = static_cast<uint16_t>(online_mask_ | (1u << index));
+  (void)imus_[index]->SetOutputRate(kImuOutputRate);
   (void)imus_[index]->SetAxis9();
   return true;
 }

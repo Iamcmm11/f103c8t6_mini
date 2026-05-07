@@ -121,11 +121,24 @@ void IMUUartBridgeTask::Run() {
 
 void IMUUartBridgeTask::RunStreamMode() {
   // 文本模式只关心 imu_data 主题，并把第一个 IMU 的欧拉角输出成 CSV。
-  imu_subscriber_ = new Topic::ASyncSubscriber<Manager::IMUArrayMsg>("imu_data");
-  imu_subscriber_->StartWaiting();
+  auto topic = Topic::Find("imu_data");
+  if (topic != nullptr) {
+    imu_subscriber_ =
+        new Topic::ASyncSubscriber<Manager::IMUArrayMsg>(Topic(topic));
+  }
+  if (imu_subscriber_ != nullptr) {
+    imu_subscriber_->StartWaiting();
+  }
   (void)WriteString("roll_deg,pitch_deg,yaw_deg\r\n");
+  if (imu_subscriber_ == nullptr) {
+    (void)WriteString("# imu_data topic unavailable\r\n");
+  }
 
   while (running_) {
+    if (imu_subscriber_ == nullptr) {
+      Thread::Sleep(20);
+      continue;
+    }
     if (imu_subscriber_->Available()) {
       auto& imu_msg = imu_subscriber_->GetData();
       if (imu_msg.IsValid(0)) {
@@ -155,8 +168,11 @@ void IMUUartBridgeTask::RunStreamMode() {
 void IMUUartBridgeTask::RunBridgeMode() {
   if (config_.push_imu_euler_in_bridge) {
     // 桥接模式下额外订阅 imu_data，用于主动向上位机推送 IMU 帧。
-    imu_subscriber_ =
-        new Topic::ASyncSubscriber<Manager::IMUArrayMsg>("imu_data");
+    auto topic = Topic::Find("imu_data");
+    if (topic != nullptr) {
+      imu_subscriber_ =
+          new Topic::ASyncSubscriber<Manager::IMUArrayMsg>(Topic(topic));
+    }
     if (imu_subscriber_ != nullptr) {
       imu_subscriber_->StartWaiting();
       last_bridge_push_ms_ = Thread::GetTime();
