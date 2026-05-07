@@ -13,16 +13,22 @@ using namespace LibXR;
 
 namespace {
 
+// JY901B 连续数据区：一次读回 acc/gyro/mag/angle/temperature。
 constexpr uint32_t kDataRegStart = 0x34;
 constexpr uint32_t kDataRegCount = 13;
+// 四元数寄存器单独位于另一段地址空间。
 constexpr uint32_t kQuatRegStart = 0x51;
 constexpr uint32_t kQuatRegCount = 4;
+// 上电后给 IMU 一点稳定时间，再开始探测。
 constexpr uint32_t kInitBootDelayMs = 120;
+// 初始化阶段允许有限次重试，降低刚上电时的偶发探测失败。
 constexpr uint32_t kInitProbeRetryCount = 5;
 constexpr uint32_t kInitProbeRetryDelayMs = 25;
+// IMU 采集线程自己的栈，和 defaultTask / bridge task 的栈彼此独立。
 constexpr uint32_t kAcquisitionStackBytes = 2048;
 constexpr uint32_t kTaskCreateOverheadBytes = 384;
 constexpr uint32_t kTaskCreateSafetyBytes = 256;
+// 兜底采样频率，仅用于还未启动采集线程时构造默认 VQF 实例。
 constexpr float kDefaultVQFSampleHz = 100.0f;
 
 }  // namespace
@@ -97,6 +103,7 @@ ErrorCode IMUManager::Init(I2C* i2c, uint8_t base_address) {
 }
 
 ErrorCode IMUManager::ReadAll(IMUArrayMsg& msg) {
+  // 采集线程和桥接线程都可能碰 I2C，这里统一串行化。
   Mutex::LockGuard guard(bus_mutex_);
 
   msg = IMUArrayMsg{};
@@ -115,6 +122,7 @@ ErrorCode IMUManager::ReadAll(IMUArrayMsg& msg) {
       continue;
     }
 
+    // 先保留原始 IMU 数据，再按当前配置决定 quaternion 字段最终来自哪里。
     ConvertIMUData(raw, msg.imu_data[i]);
     ApplyQuaternionSource(i, msg.imu_data[i]);
     msg.imu_data[i].timestamp_us = Timebase::GetMicroseconds();
@@ -161,6 +169,7 @@ ErrorCode IMUManager::StartAcquisition(uint32_t frequency_hz,
   const size_t required_heap = static_cast<size_t>(kAcquisitionStackBytes) +
                                kTaskCreateOverheadBytes +
                                kTaskCreateSafetyBytes;
+  // 这里只检查“能不能创建线程”，不代表线程运行时栈一定足够。
   if (xPortGetFreeHeapSize() < required_heap) {
     return ErrorCode::NO_MEM;
   }
@@ -171,6 +180,7 @@ ErrorCode IMUManager::StartAcquisition(uint32_t frequency_hz,
   }
 
   if (topic_name != nullptr) {
+    // 单发布者 topic，不启用 multi_publisher mutex。
     data_topic_ =
         new Topic(topic_name, sizeof(IMUArrayMsg), nullptr, false, false, false);
     if (data_topic_ == nullptr) {
@@ -179,6 +189,7 @@ ErrorCode IMUManager::StartAcquisition(uint32_t frequency_hz,
   }
 
   frequency_hz_ = frequency_hz;
+  // VQF 依赖采样周期 dt，频率变化后必须重建系数和状态。
   InitVQF(static_cast<float>(frequency_hz_));
   running_ = true;
   acquisition_thread_.Create(this, AcquisitionThreadFunc, "IMUMgrAcq",
@@ -234,6 +245,7 @@ void IMUManager::InitVQF(float sample_hz) {
 
   ReleaseVQF();
 
+  // 这一组参数来自 robot_arm 里的迁移配置，偏向稳定的 9D 姿态输出。
   vqf_params_ = ::VQFParams();
   vqf_params_.tauAcc = 2.0;
   vqf_params_.tauMag = 15.0;
@@ -268,6 +280,7 @@ void IMUManager::InitVQF(float sample_hz) {
   const vqf_real_t sample_period_s =
       static_cast<vqf_real_t>(1.0 / static_cast<double>(sample_hz));
   for (uint8_t i = 0; i < imu_count_; ++i) {
+    // 每路 IMU 各建一份滤波器，避免多路姿态状态混用。
     vqf_[i] = new ::VQF(vqf_params_, sample_period_s, -1.0, -1.0);
   }
 }
@@ -300,11 +313,13 @@ void IMUManager::ApplyQuaternionSource(uint8_t index, IMUData& data) {
       static_cast<vqf_real_t>(data.mag[2]),
   };
 
+  // 不管最后是否选择 VQF 输出，都先推进一次滤波器内部状态。
   vqf_[index]->update(gyr, acc, mag);
   if (quaternion_source_ != QuaternionSource::VQF) {
     return;
   }
 
+  // 当前选择 VQF 源时，用 9D 输出覆盖 quaternion 字段。
   vqf_real_t q[4] = {1.0, 0.0, 0.0, 0.0};
   vqf_[index]->getQuat9D(q);
   data.quaternion[0] = static_cast<float>(q[0]);
@@ -324,6 +339,7 @@ bool IMUManager::ReadRawIMU(uint8_t index,
     return false;
   }
 
+  // 四元数寄存器读失败时，其它数据仍然可用；只把 quat 字段标为无效。
   const bool quat_ok =
       imus_[index]->ReadReg(kQuatRegStart, kQuatRegCount) ==
       Module::WitIMU::ErrorCode::OK;
@@ -370,6 +386,7 @@ void IMUManager::AcquisitionThreadFunc(IMUManager* manager) {
 
   MillisecondTimestamp last_wakeup(Thread::GetTime());
   while (manager->running_) {
+    // 每个周期在栈上构造一帧消息，然后直接发布给订阅者。
     IMUArrayMsg msg;
     if (manager->ReadAll(msg) == ErrorCode::OK) {
       if (manager->data_topic_ != nullptr) {

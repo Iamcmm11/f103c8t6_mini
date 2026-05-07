@@ -43,7 +43,7 @@ namespace {
 constexpr bool kEnableUart5PlaintextDiag = false;
 constexpr bool kEnableUart5BootLog = true;
 constexpr uint16_t kWS2812LedCount = 16;
-// 默认四元数输出源，改这里就能在 VQF / IMU 原生四元数之间切换。
+// 默认四元数输出源，改这里就能在 VQF / ImuRaw 原生四元数之间切换。
 constexpr ::Manager::QuaternionSource kDefaultQuaternionSource = ::Manager::QuaternionSource::VQF;
 
 // 通过 HAL 直接向 UART5 发送字符串，适合上电阶段做简单阻塞日志输出。
