@@ -13,20 +13,17 @@ using namespace LibXR;
 
 namespace {
 
-// JY901B 连续数据区起始寄存器：加速度、角速度、磁场、欧拉角等都从这里往后读取。
 constexpr uint32_t kDataRegStart = 0x34;
 constexpr uint32_t kDataRegCount = 13;
-// 四元数数据单独放在另一段寄存器区。
 constexpr uint32_t kQuatRegStart = 0x51;
 constexpr uint32_t kQuatRegCount = 4;
-// 给 IMU 上电稳定留一点时间，再开始初始化探测。
 constexpr uint32_t kInitBootDelayMs = 120;
 constexpr uint32_t kInitProbeRetryCount = 5;
 constexpr uint32_t kInitProbeRetryDelayMs = 25;
-// 采集线程使用的任务栈和预留堆空间。
-constexpr uint32_t kAcquisitionStackBytes = 1024;
+constexpr uint32_t kAcquisitionStackBytes = 2048;
 constexpr uint32_t kTaskCreateOverheadBytes = 384;
 constexpr uint32_t kTaskCreateSafetyBytes = 256;
+constexpr float kDefaultVQFSampleHz = 100.0f;
 
 }  // namespace
 
@@ -34,18 +31,22 @@ IMUManager::IMUManager(uint8_t imu_count)
     : i2c_(nullptr),
       imu_count_(imu_count > MAX_IMU_COUNT ? MAX_IMU_COUNT : imu_count),
       base_address_(kDefaultImuAddress),
+      vqf_params_(),
+      quaternion_source_(QuaternionSource::VQF),
       online_mask_(0),
       sequence_(0),
       data_topic_(nullptr),
       running_(false),
       frequency_hz_(100) {
   imus_.fill(nullptr);
+  vqf_.fill(nullptr);
+  InitVQF(static_cast<float>(frequency_hz_));
 }
 
 IMUManager::~IMUManager() {
   StopAcquisition();
+  ReleaseVQF();
 
-  // manager 销毁时统一释放底层 Module::WitIMU 对象，避免资源泄漏。
   for (auto*& imu : imus_) {
     delete imu;
     imu = nullptr;
@@ -62,7 +63,6 @@ ErrorCode IMUManager::Init(I2C* i2c, uint8_t base_address) {
   online_mask_ = 0;
   sequence_ = 0;
 
-  // 让传感器有充足的上电稳定时间，避免刚上电时探测失败。
   Thread::Sleep(kInitBootDelayMs);
 
   uint8_t success_count = 0;
@@ -77,7 +77,6 @@ ErrorCode IMUManager::Init(I2C* i2c, uint8_t base_address) {
       continue;
     }
 
-    // 上电阶段可能存在偶发探测失败，这里做有限次重试提高成功率。
     bool online = false;
     for (uint32_t attempt = 0; attempt < kInitProbeRetryCount; ++attempt) {
       if (ProbeIMU(i)) {
@@ -88,6 +87,7 @@ ErrorCode IMUManager::Init(I2C* i2c, uint8_t base_address) {
         Thread::Sleep(kInitProbeRetryDelayMs);
       }
     }
+
     if (online) {
       ++success_count;
     }
@@ -97,7 +97,6 @@ ErrorCode IMUManager::Init(I2C* i2c, uint8_t base_address) {
 }
 
 ErrorCode IMUManager::ReadAll(IMUArrayMsg& msg) {
-  // 采集线程和桥接线程都可能访问 I2C，总线读流程必须串行化。
   Mutex::LockGuard guard(bus_mutex_);
 
   msg = IMUArrayMsg{};
@@ -116,8 +115,8 @@ ErrorCode IMUManager::ReadAll(IMUArrayMsg& msg) {
       continue;
     }
 
-    // 这里把底层模块量纲转换成对业务层友好的统一结构，并补上时间戳。
     ConvertIMUData(raw, msg.imu_data[i]);
+    ApplyQuaternionSource(i, msg.imu_data[i]);
     msg.imu_data[i].timestamp_us = Timebase::GetMicroseconds();
     msg.SetValid(i, true);
     ++valid_count;
@@ -142,6 +141,7 @@ ErrorCode IMUManager::ReadSingle(uint8_t index, IMUData& data) {
   }
 
   ConvertIMUData(raw, data);
+  ApplyQuaternionSource(index, data);
   data.timestamp_us = Timebase::GetMicroseconds();
   return ErrorCode::OK;
 }
@@ -161,7 +161,6 @@ ErrorCode IMUManager::StartAcquisition(uint32_t frequency_hz,
   const size_t required_heap = static_cast<size_t>(kAcquisitionStackBytes) +
                                kTaskCreateOverheadBytes +
                                kTaskCreateSafetyBytes;
-  // 在线程创建前先检查 FreeRTOS 剩余堆，避免任务起到一半因为内存不足失败。
   if (xPortGetFreeHeapSize() < required_heap) {
     return ErrorCode::NO_MEM;
   }
@@ -180,8 +179,8 @@ ErrorCode IMUManager::StartAcquisition(uint32_t frequency_hz,
   }
 
   frequency_hz_ = frequency_hz;
+  InitVQF(static_cast<float>(frequency_hz_));
   running_ = true;
-  // 采集任务优先级设成 HIGH，保证姿态数据尽量按频率稳定产生。
   acquisition_thread_.Create(this, AcquisitionThreadFunc, "IMUMgrAcq",
                              kAcquisitionStackBytes, Thread::Priority::HIGH);
   return ErrorCode::OK;
@@ -198,7 +197,6 @@ void IMUManager::StopAcquisition() {
   if (period_ms == 0U) {
     period_ms = 1U;
   }
-  // 给线程留出 1~2 个周期自然退出的时间，再回收 Topic 资源。
   Thread::Sleep(period_ms * 2U);
 
   if (data_topic_ != nullptr) {
@@ -221,11 +219,102 @@ uint8_t IMUManager::GetOnlineCount() const {
   return count;
 }
 
+void IMUManager::SetQuaternionSource(QuaternionSource source) {
+  quaternion_source_ = source;
+}
+
 bool IMUManager::AcquireBus() { return bus_mutex_.Lock() == ErrorCode::OK; }
 
 void IMUManager::ReleaseBus() { bus_mutex_.Unlock(); }
 
-bool IMUManager::ReadRawIMU(uint8_t index, Module::WitIMU::ImuData& raw_data) {
+void IMUManager::InitVQF(float sample_hz) {
+  if (sample_hz <= 0.0f) {
+    sample_hz = kDefaultVQFSampleHz;
+  }
+
+  ReleaseVQF();
+
+  vqf_params_ = ::VQFParams();
+  vqf_params_.tauAcc = 2.0;
+  vqf_params_.tauMag = 15.0;
+#ifndef VQF_NO_MOTION_BIAS_ESTIMATION
+  vqf_params_.motionBiasEstEnabled = true;
+#endif
+  vqf_params_.restBiasEstEnabled = true;
+  vqf_params_.magDistRejectionEnabled = true;
+  vqf_params_.biasSigmaInit = 0.5;
+  vqf_params_.biasForgettingTime = 50.0;
+  vqf_params_.biasClip = 2.0;
+#ifndef VQF_NO_MOTION_BIAS_ESTIMATION
+  vqf_params_.biasSigmaMotion = 0.05;
+  vqf_params_.biasVerticalForgettingFactor = 0.0001;
+#endif
+  vqf_params_.biasSigmaRest = 0.02;
+  vqf_params_.restMinT = 1.0;
+  vqf_params_.restFilterTau = 0.5;
+  vqf_params_.restThGyr = 3.0;
+  vqf_params_.restThAcc = 0.8;
+  vqf_params_.magCurrentTau = 0.08;
+  vqf_params_.magRefTau = 30.0;
+  vqf_params_.magNormTh = 0.08;
+  vqf_params_.magDipTh = 8.0;
+  vqf_params_.magNewTime = 60.0;
+  vqf_params_.magNewFirstTime = 3.0;
+  vqf_params_.magNewMinGyr = 15.0;
+  vqf_params_.magMinUndisturbedTime = 0.2;
+  vqf_params_.magMaxRejectionTime = 30.0;
+  vqf_params_.magRejectionFactor = 1.2;
+
+  const vqf_real_t sample_period_s =
+      static_cast<vqf_real_t>(1.0 / static_cast<double>(sample_hz));
+  for (uint8_t i = 0; i < imu_count_; ++i) {
+    vqf_[i] = new ::VQF(vqf_params_, sample_period_s, -1.0, -1.0);
+  }
+}
+
+void IMUManager::ReleaseVQF() {
+  for (auto*& filter : vqf_) {
+    delete filter;
+    filter = nullptr;
+  }
+}
+
+void IMUManager::ApplyQuaternionSource(uint8_t index, IMUData& data) {
+  if (index >= MAX_IMU_COUNT || vqf_[index] == nullptr) {
+    return;
+  }
+
+  const vqf_real_t gyr[3] = {
+      static_cast<vqf_real_t>(data.gyro[0]),
+      static_cast<vqf_real_t>(data.gyro[1]),
+      static_cast<vqf_real_t>(data.gyro[2]),
+  };
+  const vqf_real_t acc[3] = {
+      static_cast<vqf_real_t>(data.acc[0]),
+      static_cast<vqf_real_t>(data.acc[1]),
+      static_cast<vqf_real_t>(data.acc[2]),
+  };
+  const vqf_real_t mag[3] = {
+      static_cast<vqf_real_t>(data.mag[0]),
+      static_cast<vqf_real_t>(data.mag[1]),
+      static_cast<vqf_real_t>(data.mag[2]),
+  };
+
+  vqf_[index]->update(gyr, acc, mag);
+  if (quaternion_source_ != QuaternionSource::VQF) {
+    return;
+  }
+
+  vqf_real_t q[4] = {1.0, 0.0, 0.0, 0.0};
+  vqf_[index]->getQuat9D(q);
+  data.quaternion[0] = static_cast<float>(q[0]);
+  data.quaternion[1] = static_cast<float>(q[1]);
+  data.quaternion[2] = static_cast<float>(q[2]);
+  data.quaternion[3] = static_cast<float>(q[3]);
+}
+
+bool IMUManager::ReadRawIMU(uint8_t index,
+                            Module::WitIMU::ImuData& raw_data) {
   if (index >= imu_count_ || imus_[index] == nullptr) {
     return false;
   }
@@ -235,7 +324,6 @@ bool IMUManager::ReadRawIMU(uint8_t index, Module::WitIMU::ImuData& raw_data) {
     return false;
   }
 
-  // 先读主数据区，再补读四元数区；四元数失败时其余姿态数据仍然允许保留。
   const bool quat_ok =
       imus_[index]->ReadReg(kQuatRegStart, kQuatRegCount) ==
       Module::WitIMU::ErrorCode::OK;
@@ -258,7 +346,6 @@ bool IMUManager::ProbeIMU(uint8_t index) {
     return false;
   }
 
-  // Probe 本质上就是做一次真实读操作：能读通就记为在线，并切到 9 轴融合模式。
   Module::WitIMU::ImuData raw{};
   if (!ReadRawIMU(index, raw)) {
     online_mask_ = static_cast<uint16_t>(online_mask_ & ~(1u << index));
@@ -286,7 +373,6 @@ void IMUManager::AcquisitionThreadFunc(IMUManager* manager) {
     IMUArrayMsg msg;
     if (manager->ReadAll(msg) == ErrorCode::OK) {
       if (manager->data_topic_ != nullptr) {
-        // 采到新数据后立刻发布，桥接层和其它订阅者只需监听 imu_data 即可。
         manager->data_topic_->Publish(msg);
       }
     }
@@ -299,12 +385,10 @@ void IMUManager::AcquisitionThreadFunc(IMUManager* manager) {
 
 void IMUManager::ConvertIMUData(const Module::WitIMU::ImuData& src,
                                 IMUData& dst) const {
-  // 底层模块给出的是芯片原始量纲，这里统一转换为业务层固定使用的单位。
   dst.acc[0] = src.acc_x * 9.80665f;
   dst.acc[1] = src.acc_y * 9.80665f;
   dst.acc[2] = src.acc_z * 9.80665f;
 
-  // JY901B 输出角速度单位为 deg/s，这里转成 rad/s 方便后续算法统一处理。
   constexpr float kDegToRad = 0.0174532925f;
   dst.gyro[0] = src.gyro_x * kDegToRad;
   dst.gyro[1] = src.gyro_y * kDegToRad;
@@ -318,19 +402,20 @@ void IMUManager::ConvertIMUData(const Module::WitIMU::ImuData& src,
   dst.mag[1] = src.mag_y;
   dst.mag[2] = src.mag_z;
   dst.temperature = src.temperature;
+
   if (src.quat_valid) {
     dst.quaternion[0] = src.q0;
     dst.quaternion[1] = src.q1;
     dst.quaternion[2] = src.q2;
     dst.quaternion[3] = src.q3;
   } else {
-    // 四元数未读到时保留 NaN，方便上层一眼看出该字段当前不可用。
     const float nan = std::numeric_limits<float>::quiet_NaN();
     dst.quaternion[0] = nan;
     dst.quaternion[1] = nan;
     dst.quaternion[2] = nan;
     dst.quaternion[3] = nan;
   }
+
   dst.status = 0;
 }
 
