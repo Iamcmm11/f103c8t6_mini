@@ -361,13 +361,19 @@ bool IMUManager::ReadRawIMU(uint8_t index,
     return false;
   }
 
-  // 四元数寄存器读失败时，其它数据仍然可用；只把 quat 字段标为无效。
-  const bool quat_ok =
-      imus_[index]->ReadReg(kQuatRegStart, kQuatRegCount) ==
-      Module::WitIMU::ErrorCode::OK;
+  // Native quaternion is optional; VQF mode computes quaternion from
+  // gyro/acc/mag, so skipping this read saves one I2C transaction per IMU.
+  const bool need_native_quat = quaternion_source_ == QuaternionSource::ImuRaw;
+  bool quat_ok = false;
+  if (need_native_quat) {
+    // Only fetch the IMU-native quaternion when it will be used as output.
+    // VQF output is computed from gyro/acc/mag and overwrites this field.
+    quat_ok = imus_[index]->ReadReg(kQuatRegStart, kQuatRegCount) ==
+              Module::WitIMU::ErrorCode::OK;
+  }
   imus_[index]->UpdateDataFromRegisters();
   imus_[index]->GetData(raw_data);
-  if (!quat_ok) {
+  if (need_native_quat && !quat_ok) {
     const float nan = std::numeric_limits<float>::quiet_NaN();
     raw_data.q0 = nan;
     raw_data.q1 = nan;

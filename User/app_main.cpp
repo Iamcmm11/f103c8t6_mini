@@ -43,7 +43,7 @@ namespace {
 constexpr bool kEnableUart5PlaintextDiag = false;
 constexpr bool kEnableUart5BootLog = true;
 constexpr uint16_t kWS2812LedCount = 16;
-constexpr uint32_t kImuAcquisitionHz = 200;
+constexpr uint32_t kImuAcquisitionHz = 50;
 // 默认四元数输出源，改这里就能在 VQF / ImuRaw 原生四元数之间切换。
 constexpr ::Manager::QuaternionSource kDefaultQuaternionSource = ::Manager::QuaternionSource::VQF;
 
