@@ -58,6 +58,13 @@ struct IMUData {
   uint8_t reserved[3] = {0, 0, 0};
 };
 
+struct YISQuaternionMsg {
+  uint64_t timestamp_us = 0;
+  float quaternion[4] = {1.0f, 0.0f, 0.0f, 0.0f};
+  uint8_t status = 0;
+  uint8_t reserved[3] = {0, 0, 0};
+};
+
 // 一帧 IMU 主题消息，包含时间戳、序号、有效位和全部槽位数据。
 struct IMUArrayMsg {
   uint64_t timestamp_us = 0;

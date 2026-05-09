@@ -26,7 +26,6 @@ constexpr uint32_t kInitProbeRetryCount = 5;
 constexpr uint32_t kInitProbeRetryDelayMs = 25;
 constexpr Module::WitIMU::OutputRate kImuOutputRate = Module::WitIMU::OutputRate::RATE_200HZ;
 // IMU 采集线程自己的栈，和 defaultTask / bridge task 的栈彼此独立。
-constexpr uint32_t kAcquisitionStackBytes = 2048;
 constexpr uint32_t kTaskCreateOverheadBytes = 384;
 constexpr uint32_t kTaskCreateSafetyBytes = 256;
 // 兜底采样频率，仅用于还未启动采集线程时构造默认 VQF 实例。
@@ -176,19 +175,19 @@ ErrorCode IMUManager::ReadSingle(uint8_t index, IMUData& data) {
   return ErrorCode::OK;
 }
 
-ErrorCode IMUManager::StartAcquisition(uint32_t frequency_hz,
-                                       const char* topic_name) {
+ErrorCode IMUManager::StartAcquisition(
+    const IMUManagerAcquisitionConfig& config) {
   if (running_) {
     return ErrorCode::BUSY;
   }
-  if (frequency_hz == 0U) {
+  if (config.frequency_hz == 0U || config.stack_size == 0U) {
     return ErrorCode::ARG_ERR;
   }
   if (online_mask_ == 0U) {
     return ErrorCode::INIT_ERR;
   }
 
-  const size_t required_heap = static_cast<size_t>(kAcquisitionStackBytes) +
+  const size_t required_heap = static_cast<size_t>(config.stack_size) +
                                kTaskCreateOverheadBytes +
                                kTaskCreateSafetyBytes;
   // 这里只检查“能不能创建线程”，不代表线程运行时栈一定足够。
@@ -201,21 +200,22 @@ ErrorCode IMUManager::StartAcquisition(uint32_t frequency_hz,
     data_topic_ = nullptr;
   }
 
-  if (topic_name != nullptr) {
+  if (config.topic_name != nullptr) {
     // 单发布者 topic，不启用 multi_publisher mutex。
-    data_topic_ =
-        new Topic(topic_name, sizeof(IMUArrayMsg), nullptr, false, false, false);
+    data_topic_ = new Topic(config.topic_name, sizeof(IMUArrayMsg), nullptr,
+                            false, false, false);
     if (data_topic_ == nullptr) {
       return ErrorCode::NO_MEM;
     }
   }
 
-  frequency_hz_ = frequency_hz;
+  frequency_hz_ = config.frequency_hz;
   // VQF 依赖采样周期 dt，频率变化后必须重建系数和状态。
   InitVQF(static_cast<float>(frequency_hz_));
   running_ = true;
   acquisition_thread_.Create(this, AcquisitionThreadFunc, "IMUMgrAcq",
-                             kAcquisitionStackBytes, Thread::Priority::HIGH);
+                             config.stack_size,
+                             static_cast<Thread::Priority>(config.priority));
   return ErrorCode::OK;
 }
 
@@ -391,7 +391,7 @@ bool IMUManager::ProbeIMU(uint8_t index) {
   }
 
   Module::WitIMU::ImuData raw{};
-  if (!ReadRawIMU(index, raw)) {
+  if (!ReadRawIMU(index, raw) || !IsPlausibleProbeData(raw)) {
     online_mask_ = static_cast<uint16_t>(online_mask_ & ~(1u << index));
     return false;
   }
@@ -400,6 +400,17 @@ bool IMUManager::ProbeIMU(uint8_t index) {
   (void)imus_[index]->SetOutputRate(kImuOutputRate);
   (void)imus_[index]->SetAxis9();
   return true;
+}
+
+bool IMUManager::IsPlausibleProbeData(const Module::WitIMU::ImuData& raw_data) {
+  if (!raw_data.acc_valid || !raw_data.gyro_valid || !raw_data.angle_valid) {
+    return false;
+  }
+
+  const float acc_norm_sq = raw_data.acc_x * raw_data.acc_x +
+                            raw_data.acc_y * raw_data.acc_y +
+                            raw_data.acc_z * raw_data.acc_z;
+  return acc_norm_sq > 0.04f && acc_norm_sq < 16.0f;
 }
 
 void IMUManager::AcquisitionThreadFunc(IMUManager* manager) {

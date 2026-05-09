@@ -5,6 +5,7 @@ add_library(${PROJECT_NAME} STATIC)
 
 target_sources(${PROJECT_NAME} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/wit_imu_jy901b/mod_wit_imu.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/yesense_yis_imu/yis_imu.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/ws2812/ws2812_strip.cpp
 )
 

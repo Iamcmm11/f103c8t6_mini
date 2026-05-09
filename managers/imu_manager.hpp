@@ -14,6 +14,13 @@
 
 namespace Manager {
 
+struct IMUManagerAcquisitionConfig {
+  uint32_t frequency_hz = 50;
+  const char* topic_name = "imu_data";
+  uint32_t priority = static_cast<uint32_t>(LibXR::Thread::Priority::HIGH);
+  uint32_t stack_size = 2048;
+};
+
 // 四元数输出源：
 // - VQF: 使用 acc/gyro/mag 经 VQF 融合得到的姿态
 // - ImuRaw: 直接使用 IMU 自身寄存器提供的四元数
@@ -35,8 +42,9 @@ class IMUManager {
   // 单独读取一个槽位，常用于调试或局部查询。
   LibXR::ErrorCode ReadSingle(uint8_t index, IMUData& data);
   // 启动后台采集线程，并持续向 topic_name 发布 IMU 数据。
-  LibXR::ErrorCode StartAcquisition(uint32_t frequency_hz,
-                                    const char* topic_name = "imu_data");
+  LibXR::ErrorCode StartAcquisition(
+      const IMUManagerAcquisitionConfig& config =
+          IMUManagerAcquisitionConfig{});
   void StopAcquisition();
 
   bool IsIMUOnline(uint8_t index) const;
@@ -60,6 +68,7 @@ class IMUManager {
   void ConvertIMUData(const Module::WitIMU::ImuData& src, IMUData& dst) const;
   bool ReadRawIMU(uint8_t index, Module::WitIMU::ImuData& raw_data);
   bool ProbeIMU(uint8_t index);
+  static bool IsPlausibleProbeData(const Module::WitIMU::ImuData& raw_data);
   static void AcquisitionThreadFunc(IMUManager* manager);
 
   LibXR::I2C* i2c_;
