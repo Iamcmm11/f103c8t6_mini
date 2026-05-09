@@ -58,8 +58,9 @@ struct IMUData {
   uint8_t reserved[3] = {0, 0, 0};
 };
 
-struct YISQuaternionMsg {
+struct YISPoseMsg {
   uint64_t timestamp_us = 0;
+  float euler[3] = {0.0f, 0.0f, 0.0f};
   float quaternion[4] = {1.0f, 0.0f, 0.0f, 0.0f};
   uint8_t status = 0;
   uint8_t reserved[3] = {0, 0, 0};

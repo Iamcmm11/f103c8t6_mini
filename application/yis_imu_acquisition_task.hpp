@@ -15,7 +15,7 @@ struct YISIMUAcquisitionConfig {
   uint32_t priority = static_cast<uint32_t>(LibXR::Thread::Priority::MEDIUM);
   uint32_t stack_size = 1024;
   uint32_t log_interval = 100;
-  const char* topic_name = "yis_imu_quat";
+  const char* topic_name = "yis_imu_pose";
   void (*log_writer)(const char* text) = nullptr;
 };
 
@@ -33,7 +33,8 @@ class YISIMUAcquisitionTask {
   static void TaskEntry(YISIMUAcquisitionTask* task);
   void Run();
   void Log(const char* text);
-  void LogQuaternion(const Manager::YISQuaternionMsg& msg);
+  void LogEuler(const float euler_rpy[3], uint8_t status);
+  void LogQuaternion(const Manager::YISPoseMsg& msg);
   void LogFailure(LibXR::ErrorCode ec, const int32_t raw_quat[4],
                   float norm_sq);
   void LogProbeRegisters();

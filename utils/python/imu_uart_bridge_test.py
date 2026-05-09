@@ -64,6 +64,10 @@ MIN_BLINK_INTERVAL_MS = 20
 MAX_BLINK_INTERVAL_MS = 0xFFFF
 MAX_FRAME_PAYLOAD = 1024
 IMU_PUSH_LEGACY_RECORD_SIZE = struct.calcsize("<Bfff")
+IMU_PUSH_POSE_FLOAT_COUNT = 7
+IMU_PUSH_POSE_RECORD_SIZE = struct.calcsize(
+    "<B" + ("f" * IMU_PUSH_POSE_FLOAT_COUNT)
+)
 IMU_PUSH_EXTENDED_FLOAT_COUNT = 13
 IMU_PUSH_EXTENDED_RECORD_SIZE = struct.calcsize(
     "<B" + ("f" * IMU_PUSH_EXTENDED_FLOAT_COUNT)
@@ -96,8 +100,11 @@ class IMUPushRecord:
     quat_y: float = math.nan
     quat_z: float = math.nan
 
-    def has_extended_data(self) -> bool:
+    def has_motion_data(self) -> bool:
         return not math.isnan(self.acc_x)
+
+    def has_quaternion(self) -> bool:
+        return not math.isnan(self.quat_w)
 
 
 def calc_sum(data: bytes) -> int:
@@ -465,13 +472,16 @@ class BridgeClient:
                         f"rpy=({record.roll_deg:.3f},{record.pitch_deg:.3f},{record.yaw_deg:.3f})",
                     ]
                 )
-                if record.has_extended_data():
+                if record.has_motion_data():
                     parts.extend(
                         [
                             f"acc=({record.acc_x:.3f},{record.acc_y:.3f},{record.acc_z:.3f})",
                             f"gyro=({record.gyro_x:.3f},{record.gyro_y:.3f},{record.gyro_z:.3f})",
-                            f"quat=({record.quat_w:.4f},{record.quat_x:.4f},{record.quat_y:.4f},{record.quat_z:.4f})",
                         ]
+                    )
+                if record.has_quaternion():
+                    parts.append(
+                        f"quat=({record.quat_w:.4f},{record.quat_x:.4f},{record.quat_y:.4f},{record.quat_z:.4f})"
                     )
             line = ",".join(parts)
             self._print_imu_single_line(line)
@@ -509,6 +519,7 @@ class BridgeClient:
         record_size = len(records_raw) // imu_count
         if record_size not in (
             IMU_PUSH_LEGACY_RECORD_SIZE,
+            IMU_PUSH_POSE_RECORD_SIZE,
             IMU_PUSH_EXTENDED_RECORD_SIZE,
         ):
             return None
@@ -528,6 +539,22 @@ class BridgeClient:
                 roll_deg=roll_deg,
                 pitch_deg=pitch_deg,
                 yaw_deg=yaw_deg,
+            )
+
+        if len(payload) == IMU_PUSH_POSE_RECORD_SIZE:
+            values = struct.unpack(
+                "<B" + ("f" * IMU_PUSH_POSE_FLOAT_COUNT),
+                payload,
+            )
+            return IMUPushRecord(
+                imu_addr=values[0],
+                roll_deg=values[1],
+                pitch_deg=values[2],
+                yaw_deg=values[3],
+                quat_w=values[4],
+                quat_x=values[5],
+                quat_y=values[6],
+                quat_z=values[7],
             )
 
         if len(payload) == IMU_PUSH_EXTENDED_RECORD_SIZE:

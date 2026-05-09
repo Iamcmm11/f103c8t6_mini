@@ -151,22 +151,21 @@ extern "C" void app_main(void) {
   wit_acq_config.priority = static_cast<uint32_t>(LibXR::Thread::Priority::HIGH);
   wit_acq_config.stack_size = 2048;
 
-  // YIS acquisition config: 50Hz, topic "yis_imu_quat",
-  // medium priority, 1024-byte stack, log every 100 samples.
+  // YIS acquisition config: 50Hz, topic "yis_imu_pose",
+  // medium priority, 1024-byte stack.
   ::Application::YISIMUAcquisitionConfig yis_config;
   yis_config.frequency_hz = 50;
   yis_config.priority = static_cast<uint32_t>(LibXR::Thread::Priority::MEDIUM);
   yis_config.stack_size = 1024;
-  yis_config.log_interval = 100;
-  yis_config.topic_name = "yis_imu_quat";
-  yis_config.log_writer = Uart5PrintLine;
+  yis_config.topic_name = "yis_imu_pose";
   static ::Application::YISIMUAcquisitionTask yis_task(&yis_imu, yis_config);
 
-  // Bridge config: 20ms push period, medium priority, 1024-byte stack,
-  // absolute Euler output, push enabled only when WIT acquisition starts.
+  // Bridge config: 20ms push period, medium priority, 1024-byte stack.
+  // Select bridge pose source here: WIT or YIS.
   ::Application::IMUUartBridgeConfig bridge_config;
   bridge_config.stream_relative_euler = false;
   bridge_config.push_imu_euler_in_bridge = false;
+  bridge_config.pose_source = ::Application::BridgePoseSource::YIS;
   bridge_config.stream_interval_ms = 20;
   bridge_config.priority = static_cast<uint32_t>(LibXR::Thread::Priority::MEDIUM);
   bridge_config.stack_size = 1024;
@@ -180,13 +179,17 @@ extern "C" void app_main(void) {
   if (imu_init_ec == ErrorCode::OK) {
     imu_acq_ec = imu_manager.StartAcquisition(wit_acq_config);
   }
-  bridge_config.push_imu_euler_in_bridge = (imu_acq_ec == ErrorCode::OK);
 
   // 启动YIS采集任务
   LibXR::ErrorCode yis_start_ec = LibXR::ErrorCode::INIT_ERR;
   if (yis_init_ec == ErrorCode::OK) {
     yis_start_ec = yis_task.Start();
   }
+
+  bridge_config.push_imu_euler_in_bridge =
+      (bridge_config.pose_source == ::Application::BridgePoseSource::WIT)
+          ? (imu_acq_ec == ErrorCode::OK)
+          : (yis_start_ec == ErrorCode::OK);
 
   // 启动串口桥收发任务
   static ::Application::IMUUartBridgeTask imu_bridge(

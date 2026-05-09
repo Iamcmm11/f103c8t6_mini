@@ -75,7 +75,7 @@ LibXR::ErrorCode YISIMUAcquisitionTask::Start() {
     topic_ = nullptr;
   }
   topic_ = new LibXR::Topic(config_.topic_name,
-                            sizeof(Manager::YISQuaternionMsg), nullptr, false,
+                            sizeof(Manager::YISPoseMsg), nullptr, false,
                             false, false);
   if (topic_ == nullptr) {
     return LibXR::ErrorCode::NO_MEM;
@@ -108,8 +108,11 @@ void YISIMUAcquisitionTask::Run() {
   const uint32_t period_ms = FrequencyToPeriodMs(config_.frequency_hz);
   LibXR::MillisecondTimestamp last_wakeup(LibXR::Thread::GetTime());
   while (running_) {
-    Manager::YISQuaternionMsg msg;
+    Manager::YISPoseMsg msg;
     msg.timestamp_us = LibXR::Timebase::GetMicroseconds();
+    msg.euler[0] = 0.0f;
+    msg.euler[1] = 0.0f;
+    msg.euler[2] = 0.0f;
     msg.quaternion[0] = 1.0f;
     msg.quaternion[1] = 0.0f;
     msg.quaternion[2] = 0.0f;
@@ -117,11 +120,14 @@ void YISIMUAcquisitionTask::Run() {
 
     int32_t raw_quat[4] = {0, 0, 0, 0};
     float norm_sq = 0.0f;
-    const auto ec = imu_->ReadQuaternion(msg.quaternion, raw_quat, &norm_sq);
-    if (ec == LibXR::ErrorCode::OK) {
-      msg.status = 0;
+    const auto quat_ec = imu_->ReadQuaternion(msg.quaternion, raw_quat, &norm_sq);
+    const auto euler_ec = imu_->ReadEuler(msg.euler);
+    if (quat_ec == LibXR::ErrorCode::OK && euler_ec == LibXR::ErrorCode::OK) {
+      msg.status = 0U;
       first_failure_logged_ = false;
     } else {
+      const auto ec =
+          (quat_ec != LibXR::ErrorCode::OK) ? quat_ec : euler_ec;
       msg.status = static_cast<uint8_t>(-static_cast<int8_t>(ec));
       if (!first_failure_logged_) {
         LogFailure(ec, raw_quat, norm_sq);
@@ -139,7 +145,7 @@ void YISIMUAcquisitionTask::Run() {
     ++sample_count_;
     if (msg.status == 0U && config_.log_interval != 0U &&
         (sample_count_ % config_.log_interval) == 0U) {
-      LogQuaternion(msg);
+      LogEuler(msg.euler, msg.status);
     }
 
     if (!running_) {
@@ -155,8 +161,25 @@ void YISIMUAcquisitionTask::Log(const char* text) {
   }
 }
 
+void YISIMUAcquisitionTask::LogEuler(const float euler_rpy[3], uint8_t status) {
+  if (euler_rpy == nullptr) {
+    return;
+  }
+
+  char line[96] = {0};
+  char roll[16] = {0};
+  char pitch[16] = {0};
+  char yaw[16] = {0};
+  AppendFixed6(roll, sizeof(roll), FloatToMicro(euler_rpy[0]));
+  AppendFixed6(pitch, sizeof(pitch), FloatToMicro(euler_rpy[1]));
+  AppendFixed6(yaw, sizeof(yaw), FloatToMicro(euler_rpy[2]));
+  std::snprintf(line, sizeof(line), "[yis] rpy=[%s,%s,%s] st=%u", roll, pitch,
+                yaw, static_cast<unsigned>(status));
+  Log(line);
+}
+
 void YISIMUAcquisitionTask::LogQuaternion(
-    const Manager::YISQuaternionMsg& msg) {
+    const Manager::YISPoseMsg& msg) {
   char line[128] = {0};
   char q0[16] = {0};
   char q1[16] = {0};
