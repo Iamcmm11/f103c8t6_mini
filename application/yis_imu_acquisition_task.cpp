@@ -49,8 +49,9 @@ int AppendFixed6(char* out, size_t size, int32_t micro) {
 }  // namespace
 
 YISIMUAcquisitionTask::YISIMUAcquisitionTask(
-    Module::YISIMU* imu, const YISIMUAcquisitionConfig& config)
-    : imu_(imu), config_(config) {}
+    Module::YISIMU* imu, const YISIMUAcquisitionConfig& config,
+    LibXR::GPIO* dr_gpio)
+    : imu_(imu), config_(config), dr_gpio_(dr_gpio) {}
 
 LibXR::ErrorCode YISIMUAcquisitionTask::Start() {
   if (running_) {
@@ -84,6 +85,19 @@ LibXR::ErrorCode YISIMUAcquisitionTask::Start() {
   running_ = true;
   first_failure_logged_ = false;
   sample_count_ = 0;
+  while (dr_sem_.Wait(0U) == LibXR::ErrorCode::OK) {
+  }
+  if (dr_gpio_ != nullptr) {
+    dr_gpio_->RegisterCallback(
+        LibXR::GPIO::Callback::Create(OnDrInterrupt, this));
+    const auto ec = dr_gpio_->EnableInterrupt();
+    if (ec != LibXR::ErrorCode::OK) {
+      running_ = false;
+      delete topic_;
+      topic_ = nullptr;
+      return ec;
+    }
+  }
   thread_.Create(this, TaskEntry, "YISIMU", config_.stack_size,
                  static_cast<LibXR::Thread::Priority>(config_.priority));
   return LibXR::ErrorCode::OK;
@@ -95,7 +109,18 @@ void YISIMUAcquisitionTask::Stop() {
   }
 
   running_ = false;
+  dr_sem_.Post();
+  if (dr_gpio_ != nullptr) {
+    (void)dr_gpio_->DisableInterrupt();
+  }
   LibXR::Thread::Sleep(FrequencyToPeriodMs(config_.frequency_hz) + 1U);
+}
+
+void YISIMUAcquisitionTask::OnDrInterrupt(bool in_isr,
+                                          YISIMUAcquisitionTask* task) {
+  if (task != nullptr) {
+    task->dr_sem_.PostFromCallback(in_isr);
+  }
 }
 
 void YISIMUAcquisitionTask::TaskEntry(YISIMUAcquisitionTask* task) {
@@ -108,6 +133,15 @@ void YISIMUAcquisitionTask::Run() {
   const uint32_t period_ms = FrequencyToPeriodMs(config_.frequency_hz);
   LibXR::MillisecondTimestamp last_wakeup(LibXR::Thread::GetTime());
   while (running_) {
+    if (dr_gpio_ != nullptr) {
+      if (dr_sem_.Wait(config_.dr_wait_timeout_ms) != LibXR::ErrorCode::OK) {
+        if (!running_) {
+          break;
+        }
+        continue;
+      }
+    }
+
     Manager::YISPoseMsg msg;
     msg.timestamp_us = LibXR::Timebase::GetMicroseconds();
     msg.euler[0] = 0.0f;
@@ -117,11 +151,14 @@ void YISIMUAcquisitionTask::Run() {
     msg.quaternion[1] = 0.0f;
     msg.quaternion[2] = 0.0f;
     msg.quaternion[3] = 0.0f;
+    msg.sample_timestamp = 0U;
 
     int32_t raw_quat[4] = {0, 0, 0, 0};
     float norm_sq = 0.0f;
     const auto quat_ec = imu_->ReadQuaternion(msg.quaternion, raw_quat, &norm_sq);
     const auto euler_ec = imu_->ReadEuler(msg.euler);
+    const auto sample_timestamp_ec =
+        imu_->ReadSampleTimestamp(&msg.sample_timestamp);
     if (quat_ec == LibXR::ErrorCode::OK && euler_ec == LibXR::ErrorCode::OK) {
       msg.status = 0U;
       first_failure_logged_ = false;
@@ -138,6 +175,10 @@ void YISIMUAcquisitionTask::Run() {
       }
     }
 
+    if (msg.status == 0U && sample_timestamp_ec != LibXR::ErrorCode::OK) {
+      msg.sample_timestamp = 0U;
+    }
+
     if (topic_ != nullptr) {
       topic_->Publish(msg);
     }
@@ -151,7 +192,9 @@ void YISIMUAcquisitionTask::Run() {
     if (!running_) {
       break;
     }
-    LibXR::Thread::SleepUntil(last_wakeup, period_ms);
+    if (dr_gpio_ == nullptr) {
+      LibXR::Thread::SleepUntil(last_wakeup, period_ms);
+    }
   }
 }
 

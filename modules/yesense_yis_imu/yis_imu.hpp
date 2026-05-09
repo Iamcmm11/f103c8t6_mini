@@ -23,6 +23,7 @@ class YISIMU {
   LibXR::ErrorCode ReadQuaternion(float quat[4]);
   LibXR::ErrorCode ReadQuaternion(float quat[4], int32_t raw_quat[4],
                                   float* norm_sq);
+  LibXR::ErrorCode ReadSampleTimestamp(uint32_t* timestamp);
   LibXR::ErrorCode ReadRegister(uint8_t reg, uint8_t* data, uint16_t len);
   LibXR::ErrorCode Probe();
 
@@ -33,6 +34,7 @@ class YISIMU {
   static constexpr uint8_t kAccelerationReg = 0x10;
   static constexpr uint8_t kEulerReg = 0x40;
   static constexpr uint16_t kQuaternionReg = 0x41;
+  static constexpr uint8_t kSampleTimestampReg = 0x51;
   static constexpr uint32_t kReadTimeoutMs = 50;
   static constexpr float kEulerScale = 1.0e-6f;
   static constexpr float kQuaternionScale = 1.0e-6f;

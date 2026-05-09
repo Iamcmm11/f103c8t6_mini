@@ -1,7 +1,33 @@
 GPIO:
   PA4:
     Signal: GPIO_Output
+  PA6:
+    Signal: GPXTI6
+    GPXTI: true
 Peripherals:
+  TIM:
+    TIM5:
+      Period: 9999
+      Prescaler: 6399
+      Channels:
+        CH1:
+          Label: TIM5
+          PWM: true
+          Complementary: false
+          DutyCycle: null
+      dma:
+        dma_ch1: &id004
+          request_id: '5'
+          peripheral: TIM5_CH1
+          dma_type: DMA
+          stream: DMA2_Channel5
+          direction: MEMORY
+          periph_inc: false
+          mem_inc: false
+          periph_align: halfword
+          mem_align: halfword
+          mode: Normal
+          priority: Low
   ADC: {}
   SPI:
     SPI1:
@@ -28,7 +54,7 @@ Peripherals:
     USART1:
       Mode: Asynchronous
       dma:
-        dma_rx: &id004
+        dma_rx: &id005
           request_id: '3'
           peripheral: USART1_RX
           dma_type: DMA
@@ -40,7 +66,7 @@ Peripherals:
           mem_align: byte
           mode: Normal
           priority: Low
-        dma_tx: &id005
+        dma_tx: &id006
           request_id: '2'
           peripheral: USART1_TX
           dma_type: DMA
@@ -100,13 +126,15 @@ DMA:
     '2': USART1_TX
     '3': USART1_RX
     '4': SPI1_TX
-    sNb: '5'
+    '5': TIM5_CH1
+    sNb: '6'
   Configurations:
     I2C1_RX_0: *id001
     I2C1_TX_1: *id002
     SPI1_TX_4: *id003
-    USART1_RX_3: *id004
-    USART1_TX_2: *id005
+    TIM5_CH1_5: *id004
+    USART1_RX_3: *id005
+    USART1_TX_2: *id006
 Timebase:
   Source: TIM1
   IRQ: TIM1_UP_IRQn

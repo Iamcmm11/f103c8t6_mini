@@ -68,6 +68,9 @@ IMU_PUSH_POSE_FLOAT_COUNT = 7
 IMU_PUSH_POSE_RECORD_SIZE = struct.calcsize(
     "<B" + ("f" * IMU_PUSH_POSE_FLOAT_COUNT)
 )
+IMU_PUSH_YIS_POSE_RECORD_SIZE = struct.calcsize(
+    "<B" + ("f" * IMU_PUSH_POSE_FLOAT_COUNT) + "I"
+)
 IMU_PUSH_EXTENDED_FLOAT_COUNT = 13
 IMU_PUSH_EXTENDED_RECORD_SIZE = struct.calcsize(
     "<B" + ("f" * IMU_PUSH_EXTENDED_FLOAT_COUNT)
@@ -89,6 +92,7 @@ class IMUPushRecord:
     roll_deg: float
     pitch_deg: float
     yaw_deg: float
+    sample_timestamp: Optional[int] = None
     acc_x: float = math.nan
     acc_y: float = math.nan
     acc_z: float = math.nan
@@ -105,6 +109,107 @@ class IMUPushRecord:
 
     def has_quaternion(self) -> bool:
         return not math.isnan(self.quat_w)
+
+
+@dataclass
+class SyncCycleStats:
+    imu_addr: int
+    cycle_index: int = 0
+    frame_count: int = 0
+    start_host_ms: Optional[int] = None
+    prev_host_ms: Optional[int] = None
+    start_sample_ts: Optional[int] = None
+    prev_sample_ts: Optional[int] = None
+    min_sample_ts: Optional[int] = None
+    max_sample_ts: Optional[int] = None
+    sample_step_sum: int = 0
+    sample_step_count: int = 0
+    sample_step_min: Optional[int] = None
+    sample_step_max: Optional[int] = None
+    host_step_sum_ms: int = 0
+    host_step_count: int = 0
+    host_step_min_ms: Optional[int] = None
+    host_step_max_ms: Optional[int] = None
+
+    def update(self, host_ms: int, sample_ts: int) -> None:
+        if self.frame_count == 0:
+            self.start_host_ms = host_ms
+            self.start_sample_ts = sample_ts
+            self.min_sample_ts = sample_ts
+            self.max_sample_ts = sample_ts
+        else:
+            assert self.prev_sample_ts is not None
+            assert self.prev_host_ms is not None
+            sample_step = sample_ts - self.prev_sample_ts
+            host_step_ms = host_ms - self.prev_host_ms
+            self.sample_step_sum += sample_step
+            self.sample_step_count += 1
+            self.host_step_sum_ms += host_step_ms
+            self.host_step_count += 1
+            if self.sample_step_min is None or sample_step < self.sample_step_min:
+                self.sample_step_min = sample_step
+            if self.sample_step_max is None or sample_step > self.sample_step_max:
+                self.sample_step_max = sample_step
+            if self.host_step_min_ms is None or host_step_ms < self.host_step_min_ms:
+                self.host_step_min_ms = host_step_ms
+            if self.host_step_max_ms is None or host_step_ms > self.host_step_max_ms:
+                self.host_step_max_ms = host_step_ms
+            if self.min_sample_ts is None or sample_ts < self.min_sample_ts:
+                self.min_sample_ts = sample_ts
+            if self.max_sample_ts is None or sample_ts > self.max_sample_ts:
+                self.max_sample_ts = sample_ts
+
+        self.frame_count += 1
+        self.prev_host_ms = host_ms
+        self.prev_sample_ts = sample_ts
+
+    def format_summary(self) -> str:
+        host_span_ms = 0
+        if self.start_host_ms is not None and self.prev_host_ms is not None:
+            host_span_ms = self.prev_host_ms - self.start_host_ms
+        sample_step_avg = (
+            self.sample_step_sum / self.sample_step_count
+            if self.sample_step_count > 0
+            else 0.0
+        )
+        host_step_avg_ms = (
+            self.host_step_sum_ms / self.host_step_count
+            if self.host_step_count > 0
+            else 0.0
+        )
+        return (
+            f"sync_cycle,addr,0x{self.imu_addr:02X},"
+            f"idx,{self.cycle_index},"
+            f"frames,{self.frame_count},"
+            f"host_span_ms,{host_span_ms},"
+            f"sample_ts_start,{self.start_sample_ts},"
+            f"sample_ts_min,{self.min_sample_ts},"
+            f"sample_ts_max,{self.max_sample_ts},"
+            f"sample_step_avg,{sample_step_avg:.2f},"
+            f"sample_step_min,{self.sample_step_min},"
+            f"sample_step_max,{self.sample_step_max},"
+            f"host_step_avg_ms,{host_step_avg_ms:.2f},"
+            f"host_step_min_ms,{self.host_step_min_ms},"
+            f"host_step_max_ms,{self.host_step_max_ms}"
+        )
+
+    def reset_for_next_cycle(self) -> None:
+        self.cycle_index += 1
+        self.frame_count = 0
+        self.start_host_ms = None
+        self.prev_host_ms = None
+        self.start_sample_ts = None
+        self.prev_sample_ts = None
+        self.min_sample_ts = None
+        self.max_sample_ts = None
+        self.sample_step_sum = 0
+        self.sample_step_count = 0
+        self.sample_step_min = None
+        self.sample_step_max = None
+        self.host_step_sum_ms = 0
+        self.host_step_count = 0
+        self.host_step_min_ms = None
+        self.host_step_max_ms = None
 
 
 def calc_sum(data: bytes) -> int:
@@ -472,6 +577,8 @@ class BridgeClient:
                         f"rpy=({record.roll_deg:.3f},{record.pitch_deg:.3f},{record.yaw_deg:.3f})",
                     ]
                 )
+                if record.sample_timestamp is not None:
+                    parts.append(f"sample_ts={record.sample_timestamp}")
                 if record.has_motion_data():
                     parts.extend(
                         [
@@ -520,6 +627,7 @@ class BridgeClient:
         if record_size not in (
             IMU_PUSH_LEGACY_RECORD_SIZE,
             IMU_PUSH_POSE_RECORD_SIZE,
+            IMU_PUSH_YIS_POSE_RECORD_SIZE,
             IMU_PUSH_EXTENDED_RECORD_SIZE,
         ):
             return None
@@ -555,6 +663,23 @@ class BridgeClient:
                 quat_x=values[5],
                 quat_y=values[6],
                 quat_z=values[7],
+            )
+
+        if len(payload) == IMU_PUSH_YIS_POSE_RECORD_SIZE:
+            values = struct.unpack(
+                "<B" + ("f" * IMU_PUSH_POSE_FLOAT_COUNT) + "I",
+                payload,
+            )
+            return IMUPushRecord(
+                imu_addr=values[0],
+                roll_deg=values[1],
+                pitch_deg=values[2],
+                yaw_deg=values[3],
+                quat_w=values[4],
+                quat_x=values[5],
+                quat_y=values[6],
+                quat_z=values[7],
+                sample_timestamp=values[8],
             )
 
         if len(payload) == IMU_PUSH_EXTENDED_RECORD_SIZE:
@@ -849,6 +974,46 @@ def cmd_monitor(client: BridgeClient, _args: argparse.Namespace) -> int:
         return 0
 
 
+def cmd_sync_monitor(client: BridgeClient, _args: argparse.Namespace) -> int:
+    print("Sync-monitor mode started. Waiting for sample_timestamp resets, press Ctrl+C to stop.")
+    sync_states: dict[int, SyncCycleStats] = {}
+
+    def _record(ts_unix_ms: int, imu_records: list[IMUPushRecord]) -> None:
+        for record in imu_records:
+            if record.sample_timestamp is None:
+                continue
+
+            state = sync_states.get(record.imu_addr)
+            if state is None:
+                state = SyncCycleStats(imu_addr=record.imu_addr)
+                sync_states[record.imu_addr] = state
+
+            current_sample_ts = record.sample_timestamp
+            prev_sample_ts = state.prev_sample_ts
+            if (
+                state.frame_count > 0
+                and prev_sample_ts is not None
+                and current_sample_ts < prev_sample_ts
+            ):
+                print(state.format_summary())
+                state.reset_for_next_cycle()
+
+            state.update(ts_unix_ms, current_sample_ts)
+
+    client.set_imu_record_callback(_record)
+    try:
+        while True:
+            time.sleep(0.2)
+    except KeyboardInterrupt:
+        for addr in sorted(sync_states):
+            state = sync_states[addr]
+            if state.frame_count > 0:
+                print(state.format_summary())
+        return 0
+    finally:
+        client.set_imu_record_callback(None)
+
+
 def cmd_capture(client: BridgeClient, args: argparse.Namespace) -> int:
     output_path = os.path.abspath(args.output)
     output_dir = os.path.dirname(output_path)
@@ -881,6 +1046,7 @@ def cmd_capture(client: BridgeClient, args: argparse.Namespace) -> int:
                 acc_by_addr = {}
                 gyro_by_addr = {}
                 quaternion_by_addr = {}
+                sample_timestamp_by_addr = {}
                 for record in imu_records:
                     key = f"0x{record.imu_addr:02X}"
                     poses_by_addr[key] = {
@@ -904,6 +1070,7 @@ def cmd_capture(client: BridgeClient, args: argparse.Namespace) -> int:
                         "y": _round_or_none(record.quat_y, 4),
                         "z": _round_or_none(record.quat_z, 4),
                     }
+                    sample_timestamp_by_addr[key] = record.sample_timestamp
 
                 row = {
                     "ts_iso": datetime.fromtimestamp(ts_unix_ms / 1000.0).isoformat(timespec="milliseconds"),
@@ -911,6 +1078,7 @@ def cmd_capture(client: BridgeClient, args: argparse.Namespace) -> int:
                     "acc_by_addr": {},
                     "gyro_by_addr": {},
                     "quaternion_by_addr": {},
+                    "sample_timestamp_by_addr": {},
                 }
 
                 # 固定列顺序，便于逐行对比同一地址的数据变化。
@@ -920,6 +1088,7 @@ def cmd_capture(client: BridgeClient, args: argparse.Namespace) -> int:
                     row["acc_by_addr"][key] = acc_by_addr.get(key)
                     row["gyro_by_addr"][key] = gyro_by_addr.get(key)
                     row["quaternion_by_addr"][key] = quaternion_by_addr.get(key)
+                    row["sample_timestamp_by_addr"][key] = sample_timestamp_by_addr.get(key)
 
                 # 追加非默认地址，避免丢信息。
                 for key in sorted(poses_by_addr.keys()):
@@ -928,6 +1097,7 @@ def cmd_capture(client: BridgeClient, args: argparse.Namespace) -> int:
                         row["acc_by_addr"][key] = acc_by_addr.get(key)
                         row["gyro_by_addr"][key] = gyro_by_addr.get(key)
                         row["quaternion_by_addr"][key] = quaternion_by_addr.get(key)
+                        row["sample_timestamp_by_addr"][key] = sample_timestamp_by_addr.get(key)
 
                 if not first_row:
                     f.write(",\n")
@@ -1024,6 +1194,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     monitor_parser.set_defaults(func=cmd_monitor)
 
+    sync_monitor_parser = subparsers.add_parser(
+        "sync-monitor",
+        help="analyze sample_timestamp reset cycles for externally synchronized YIS data",
+    )
+    sync_monitor_parser.set_defaults(func=cmd_sync_monitor)
+
     capture_parser = subparsers.add_parser(
         "capture",
         help="background capture mode, write IMU pushes to JSON",
@@ -1043,7 +1219,7 @@ def main() -> int:
     args = parser.parse_args()
 
     try:
-        print_imu = args.command != "capture"
+        print_imu = args.command not in {"capture", "sync-monitor"}
         with BridgeClient(
             args.port,
             args.baud,

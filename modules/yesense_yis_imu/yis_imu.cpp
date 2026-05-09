@@ -23,6 +23,13 @@ int32_t LoadLeI32(const uint8_t* data) {
   return static_cast<int32_t>(raw);
 }
 
+uint32_t LoadLeU32(const uint8_t* data) {
+  return static_cast<uint32_t>(data[0]) |
+         (static_cast<uint32_t>(data[1]) << 8U) |
+         (static_cast<uint32_t>(data[2]) << 16U) |
+         (static_cast<uint32_t>(data[3]) << 24U);
+}
+
 bool NormalizeQuaternion(float quat[4], float* norm_sq_out) {
   const float norm_sq = quat[0] * quat[0] + quat[1] * quat[1] +
                         quat[2] * quat[2] + quat[3] * quat[3];
@@ -135,6 +142,21 @@ LibXR::ErrorCode YISIMU::ReadQuaternion(float quat[4], int32_t raw_quat[4],
 
   return NormalizeQuaternion(quat, norm_sq) ? LibXR::ErrorCode::OK
                                             : LibXR::ErrorCode::CHECK_ERR;
+}
+
+LibXR::ErrorCode YISIMU::ReadSampleTimestamp(uint32_t* timestamp) {
+  if (i2c_ == nullptr || timestamp == nullptr) {
+    return LibXR::ErrorCode::PTR_NULL;
+  }
+
+  uint8_t raw[4] = {0};
+  const auto ec = ReadRegister(kSampleTimestampReg, raw, sizeof(raw));
+  if (ec != LibXR::ErrorCode::OK) {
+    return ec;
+  }
+
+  *timestamp = LoadLeU32(raw);
+  return LibXR::ErrorCode::OK;
 }
 
 LibXR::ErrorCode YISIMU::ReadRegister(uint8_t reg, uint8_t* data,

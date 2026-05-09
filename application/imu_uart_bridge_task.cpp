@@ -28,8 +28,11 @@ constexpr std::array<uint8_t, 4> kBridgeIMUPushIndexes = {
 };
 
 constexpr uint8_t kBridgePoseFloatCount = 7;
+constexpr uint8_t kBridgeYISTimestampSize = sizeof(uint32_t);
 constexpr uint8_t kBridgePoseRecordSize =
     static_cast<uint8_t>(1 + kBridgePoseFloatCount * sizeof(float));
+constexpr uint8_t kBridgeYISPoseRecordSize = static_cast<uint8_t>(
+    kBridgePoseRecordSize + kBridgeYISTimestampSize);
 constexpr uint8_t kBridgeStatusOk = 0;
 constexpr uint8_t kBridgeStatusError = 1;
 constexpr uint8_t kMaxRegisterCount = 32;
@@ -279,7 +282,7 @@ void IMUUartBridgeTask::PublishBridgePoseData() {
 
   auto& yis_msg = yis_subscriber_->GetData();
   if (yis_msg.status == 0U) {
-    std::array<uint8_t, 1 + kBridgePoseRecordSize> payload{};
+    std::array<uint8_t, 1 + kBridgeYISPoseRecordSize> payload{};
     payload[0] = 1;
     payload[1] = kYISBridgeAddress;
 
@@ -292,6 +295,9 @@ void IMUUartBridgeTask::PublishBridgePoseData() {
       std::memcpy(payload.data() + cursor, &value, sizeof(float));
       cursor = static_cast<uint16_t>(cursor + sizeof(float));
     }
+    std::memcpy(payload.data() + cursor, &yis_msg.sample_timestamp,
+                sizeof(yis_msg.sample_timestamp));
+    cursor = static_cast<uint16_t>(cursor + sizeof(yis_msg.sample_timestamp));
 
     SendResponse(kBridgeCmdPosePush, payload.data(), cursor);
     last_pose_push_ms_ = now_ms;

@@ -57,12 +57,15 @@ void DMA1_Channel4_IRQHandler(void);
 void DMA1_Channel5_IRQHandler(void);
 void DMA1_Channel6_IRQHandler(void);
 void DMA1_Channel7_IRQHandler(void);
+void EXTI9_5_IRQHandler(void);
 void TIM1_UP_IRQHandler(void);
 void I2C1_EV_IRQHandler(void);
 void I2C1_ER_IRQHandler(void);
 void SPI1_IRQHandler(void);
 void USART1_IRQHandler(void);
+void TIM5_IRQHandler(void);
 void UART5_IRQHandler(void);
+void DMA2_Channel5_IRQHandler(void);
 /* USER CODE BEGIN EFP */
 
 /* USER CODE END EFP */

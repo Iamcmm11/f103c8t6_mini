@@ -2,10 +2,12 @@
 
 #include <cstdint>
 
+#include "gpio.hpp"
 #include "libxr_def.hpp"
 #include "managers/data_types.hpp"
 #include "message.hpp"
 #include "modules/yesense_yis_imu/yis_imu.hpp"
+#include "semaphore.hpp"
 #include "thread.hpp"
 
 namespace Application {
@@ -15,6 +17,7 @@ struct YISIMUAcquisitionConfig {
   uint32_t priority = static_cast<uint32_t>(LibXR::Thread::Priority::MEDIUM);
   uint32_t stack_size = 1024;
   uint32_t log_interval = 100;
+  uint32_t dr_wait_timeout_ms = 20;
   const char* topic_name = "yis_imu_pose";
   void (*log_writer)(const char* text) = nullptr;
 };
@@ -23,13 +26,15 @@ class YISIMUAcquisitionTask {
  public:
   explicit YISIMUAcquisitionTask(
       Module::YISIMU* imu,
-      const YISIMUAcquisitionConfig& config = YISIMUAcquisitionConfig{});
+      const YISIMUAcquisitionConfig& config = YISIMUAcquisitionConfig{},
+      LibXR::GPIO* dr_gpio = nullptr);
   ~YISIMUAcquisitionTask() = default;
 
   LibXR::ErrorCode Start();
   void Stop();
 
  private:
+  static void OnDrInterrupt(bool in_isr, YISIMUAcquisitionTask* task);
   static void TaskEntry(YISIMUAcquisitionTask* task);
   void Run();
   void Log(const char* text);
@@ -41,7 +46,9 @@ class YISIMUAcquisitionTask {
 
   Module::YISIMU* imu_;
   YISIMUAcquisitionConfig config_;
+  LibXR::GPIO* dr_gpio_;
   LibXR::Thread thread_;
+  LibXR::Semaphore dr_sem_{0};
   LibXR::Topic* topic_ = nullptr;
   volatile bool running_ = false;
   bool first_failure_logged_ = false;

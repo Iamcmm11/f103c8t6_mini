@@ -1,7 +1,6 @@
 #include "app_main.h"
 
 #include "cdc_uart.hpp"
-#include "flash_map.hpp"
 #include "libxr.hpp"
 #include "main.h"
 #include "stm32_adc.hpp"
@@ -18,6 +17,7 @@
 #include "stm32_uart.hpp"
 #include "stm32_usb_dev.hpp"
 #include "stm32_watchdog.hpp"
+#include "flash_map.hpp"
 
 using namespace LibXR;
 
@@ -51,6 +51,16 @@ void Uart5PrintLine(const char* text) {
   Uart5Print("\r\n");
 }
 
+uint32_t GetTim5ClockHz() {
+  uint32_t clock_hz = HAL_RCC_GetPCLK1Freq();
+#ifdef RCC_CFGR_PPRE1
+  if ((RCC->CFGR & RCC_CFGR_PPRE1) != RCC_CFGR_PPRE1_DIV1) {
+    clock_hz *= 2U;
+  }
+#endif
+  return clock_hz;
+}
+
 }  // namespace
 /* User Code End 1 */
 // NOLINTBEGIN
@@ -59,6 +69,7 @@ void Uart5PrintLine(const char* text) {
 extern I2C_HandleTypeDef hi2c1;
 extern SPI_HandleTypeDef hspi1;
 extern TIM_HandleTypeDef htim1;
+extern TIM_HandleTypeDef htim5;
 extern UART_HandleTypeDef huart1;
 extern UART_HandleTypeDef huart5;
 
@@ -82,6 +93,10 @@ extern "C" void app_main(void) {
 
   /* GPIO Configuration */
   STM32GPIO PA4(GPIOA, GPIO_PIN_4);
+  STM32GPIO PA6(GPIOA, GPIO_PIN_6, EXTI9_5_IRQn);
+
+
+  STM32PWM pwm_tim5_ch1(&htim5, TIM_CHANNEL_1, false);
 
   STM32SPI spi1(&hspi1, {nullptr, 0}, spi1_tx_buf, 3);
 
@@ -131,6 +146,25 @@ extern "C" void app_main(void) {
                 static_cast<unsigned>(imu_manager.GetOnlineCount()));
   Uart5PrintLine(line);
 
+  const auto pwm_sync_ec = pwm_tim5_ch1.Enable();
+  const uint32_t tim5_clk_hz = GetTim5ClockHz();
+  const uint32_t tim5_psc = static_cast<uint32_t>(htim5.Init.Prescaler) + 1U;
+  const uint32_t tim5_arr = static_cast<uint32_t>(htim5.Init.Period) + 1U;
+  const uint32_t tim5_ccr = __HAL_TIM_GET_COMPARE(&htim5, TIM_CHANNEL_1);
+  const uint32_t sync_freq_hz =
+      (tim5_psc != 0U && tim5_arr != 0U) ? (tim5_clk_hz / tim5_psc / tim5_arr)
+                                         : 0U;
+
+  std::snprintf(
+      line, sizeof(line),
+      "[boot] sync pwm ec=%d clk=%lu psc=%lu arr=%lu ccr=%lu freq=%lu",
+      static_cast<int>(pwm_sync_ec), static_cast<unsigned long>(tim5_clk_hz),
+      static_cast<unsigned long>(htim5.Init.Prescaler),
+      static_cast<unsigned long>(htim5.Init.Period),
+      static_cast<unsigned long>(tim5_ccr),
+      static_cast<unsigned long>(sync_freq_hz));
+  Uart5PrintLine(line);
+
   const auto yis_init_ec = yis_imu.Init();
 
   std::snprintf(line, sizeof(line), "[boot] yis init=%d addr=0x%02X hal=0x%02X",
@@ -154,11 +188,12 @@ extern "C" void app_main(void) {
   // YIS acquisition config: 50Hz, topic "yis_imu_pose",
   // medium priority, 1024-byte stack.
   ::Application::YISIMUAcquisitionConfig yis_config;
-  yis_config.frequency_hz = 50;
+  yis_config.frequency_hz = 200;
   yis_config.priority = static_cast<uint32_t>(LibXR::Thread::Priority::MEDIUM);
   yis_config.stack_size = 1024;
+  yis_config.dr_wait_timeout_ms = 20;
   yis_config.topic_name = "yis_imu_pose";
-  static ::Application::YISIMUAcquisitionTask yis_task(&yis_imu, yis_config);
+  static ::Application::YISIMUAcquisitionTask yis_task(&yis_imu, yis_config, &PA6);
 
   // Bridge config: 20ms push period, medium priority, 1024-byte stack.
   // Select bridge pose source here: WIT or YIS.
@@ -166,7 +201,7 @@ extern "C" void app_main(void) {
   bridge_config.stream_relative_euler = false;
   bridge_config.push_imu_euler_in_bridge = false;
   bridge_config.pose_source = ::Application::BridgePoseSource::YIS;
-  bridge_config.stream_interval_ms = 20;
+  bridge_config.stream_interval_ms = 5;
   bridge_config.priority = static_cast<uint32_t>(LibXR::Thread::Priority::MEDIUM);
   bridge_config.stack_size = 1024;
 
