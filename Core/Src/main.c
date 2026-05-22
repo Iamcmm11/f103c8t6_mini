@@ -28,6 +28,7 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include "app_main.h"
 
 /* USER CODE END Includes */
 
@@ -99,6 +100,7 @@ int main(void)
   MX_UART5_Init();
   MX_USART1_UART_Init();
   MX_TIM5_Init();
+  MX_TIM6_Init();
   /* USER CODE BEGIN 2 */
 
   /* USER CODE END 2 */
@@ -188,6 +190,10 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
   if (htim->Instance == TIM1)
   {
     HAL_IncTick();
+  }
+  else if (htim->Instance == TIM6)
+  {
+    app_on_tim6_period_elapsed();
   }
   /* USER CODE BEGIN Callback 1 */
 

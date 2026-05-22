@@ -9,6 +9,7 @@
 #include "message.hpp"
 #include "modules/wit_imu_jy901b/mod_wit_imu.hpp"
 #include "mutex.hpp"
+#include "semaphore.hpp"
 #include "thread.hpp"
 #include "vqf.hpp"
 
@@ -19,6 +20,8 @@ struct IMUManagerAcquisitionConfig {
   const char* topic_name = "imu_data";
   uint32_t priority = static_cast<uint32_t>(LibXR::Thread::Priority::HIGH);
   uint32_t stack_size = 2048;
+  bool use_hardware_trigger = false;
+  uint8_t enabled_imu_count = ACTUAL_IMU_COUNT;
 };
 
 // 四元数输出源：
@@ -46,6 +49,7 @@ class IMUManager {
       const IMUManagerAcquisitionConfig& config =
           IMUManagerAcquisitionConfig{});
   void StopAcquisition();
+  static void OnHardwareTriggerTimerInterrupt(bool in_isr);
 
   bool IsIMUOnline(uint8_t index) const;
   uint8_t GetConfiguredCount() const { return imu_count_; }
@@ -60,6 +64,13 @@ class IMUManager {
   void ReleaseBus();
 
  private:
+  static constexpr uint16_t BuildLeadingSlotsMask(uint8_t imu_count) {
+    const uint8_t capped_count =
+        (imu_count > ACTUAL_IMU_COUNT) ? ACTUAL_IMU_COUNT : imu_count;
+    return (capped_count == 0U)
+               ? 0U
+               : static_cast<uint16_t>((1u << capped_count) - 1u);
+  }
   // 采样频率变化时重建每路 IMU 对应的 VQF 实例。
   void InitVQF(float sample_hz);
   void ReleaseVQF();
@@ -85,7 +96,16 @@ class IMUManager {
   LibXR::Topic* data_topic_;
   volatile bool running_;
   uint32_t frequency_hz_;
+  uint16_t enabled_slots_mask_ = 0x000F;
+  bool use_hardware_trigger_ = false;
+  volatile bool trigger_pending_ = false;
+  volatile uint32_t trigger_overrun_count_ = 0;
+  volatile uint32_t trigger_sequence_ = 0;
+  volatile uint64_t trigger_mcu_tick_us_ = 0;
+  LibXR::Semaphore acquisition_trigger_sem_{0};
   mutable LibXR::Mutex bus_mutex_;
+
+  static IMUManager* hardware_trigger_manager_;
 };
 
 }  // namespace Manager

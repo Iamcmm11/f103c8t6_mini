@@ -48,6 +48,7 @@ static_assert(ACTUAL_IMU_COUNT <= MAX_IMU_COUNT,
 // 单个 IMU 的标准化输出结构，单位和字段名对上层业务保持稳定。
 struct IMUData {
   uint64_t timestamp_us = 0;
+  uint64_t mcu_tick_us = 0;
   float acc[3] = {0.0f, 0.0f, 0.0f};
   float gyro[3] = {0.0f, 0.0f, 0.0f};
   float angle[3] = {0.0f, 0.0f, 0.0f};
@@ -70,7 +71,10 @@ struct YISPoseMsg {
 // 一帧 IMU 主题消息，包含时间戳、序号、有效位和全部槽位数据。
 struct IMUArrayMsg {
   uint64_t timestamp_us = 0;
+  uint64_t trigger_mcu_tick_us = 0;
   uint32_t sequence = 0;
+  uint32_t trigger_sequence = 0;
+  uint32_t trigger_overrun_count = 0;
   uint16_t valid_mask = 0;
   uint16_t reserved = 0;
   std::array<IMUData, ACTUAL_IMU_COUNT> imu_data{};

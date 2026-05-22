@@ -28,6 +28,9 @@ Peripherals:
           mem_align: halfword
           mode: Normal
           priority: Low
+    TIM6:
+      Period: 19999
+      Prescaler: 63
   ADC: {}
   SPI:
     SPI1:

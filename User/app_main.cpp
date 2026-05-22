@@ -3,6 +3,7 @@
 #include "cdc_uart.hpp"
 #include "libxr.hpp"
 #include "main.h"
+#include "tim.h"
 #include "stm32_adc.hpp"
 #include "stm32_can.hpp"
 #include "stm32_canfd.hpp"
@@ -34,9 +35,20 @@ using namespace LibXR;
 
 extern UART_HandleTypeDef huart5;
 
+extern "C" void app_on_tim6_period_elapsed(void) {
+  Manager::IMUManager::OnHardwareTriggerTimerInterrupt(true);
+}
+
 namespace {
 
+constexpr bool kEnableUart5LogPush = false;
+
 void Uart5Print(const char* text) {
+  if (!kEnableUart5LogPush) {
+    (void)text;
+    return;
+  }
+
   if (text == nullptr) {
     return;
   }
@@ -70,13 +82,14 @@ extern I2C_HandleTypeDef hi2c1;
 extern SPI_HandleTypeDef hspi1;
 extern TIM_HandleTypeDef htim1;
 extern TIM_HandleTypeDef htim5;
+extern TIM_HandleTypeDef htim6;
 extern UART_HandleTypeDef huart1;
 extern UART_HandleTypeDef huart5;
 
 /* DMA Resources */
 static uint8_t spi1_tx_buf[768];
 static uint8_t usart1_tx_buf[512];
-static uint8_t usart1_rx_buf[128];
+static uint8_t usart1_rx_buf[256];
 static uint8_t i2c1_buf[96];
 
 extern "C" void app_main(void) {
@@ -184,6 +197,9 @@ extern "C" void app_main(void) {
   wit_acq_config.topic_name = "imu_data";
   wit_acq_config.priority = static_cast<uint32_t>(LibXR::Thread::Priority::HIGH);
   wit_acq_config.stack_size = 2048;
+  wit_acq_config.use_hardware_trigger = true;
+  // 1 => only 0x50, 2 => 0x50+0x51, 3 => 0x50+0x51+0x52, 4 => 0x50~0x53.
+  wit_acq_config.enabled_imu_count = 1;
 
   // YIS acquisition config: 50Hz, topic "yis_imu_pose",
   // medium priority, 1024-byte stack.
@@ -199,9 +215,10 @@ extern "C" void app_main(void) {
   // Select bridge pose source here: WIT or YIS.
   ::Application::IMUUartBridgeConfig bridge_config;
   bridge_config.stream_relative_euler = false;
-  bridge_config.push_imu_euler_in_bridge = false;
-  bridge_config.pose_source = ::Application::BridgePoseSource::YIS;
-  bridge_config.stream_interval_ms = 5;
+  bridge_config.push_imu_euler_in_bridge = true;
+  bridge_config.pose_source = ::Application::BridgePoseSource::WIT;
+  bridge_config.push_all_slots_in_bridge = false;
+  bridge_config.stream_interval_ms = 20;
   bridge_config.priority = static_cast<uint32_t>(LibXR::Thread::Priority::MEDIUM);
   bridge_config.stack_size = 1024;
 
@@ -212,6 +229,7 @@ extern "C" void app_main(void) {
   // 启动901B采集任务
   ErrorCode imu_acq_ec = ErrorCode::INIT_ERR;
   if (imu_init_ec == ErrorCode::OK) {
+    (void)HAL_TIM_Base_Start_IT(&htim6);
     imu_acq_ec = imu_manager.StartAcquisition(wit_acq_config);
   }
 
@@ -221,15 +239,12 @@ extern "C" void app_main(void) {
     yis_start_ec = yis_task.Start();
   }
 
-  bridge_config.push_imu_euler_in_bridge =
-      (bridge_config.pose_source == ::Application::BridgePoseSource::WIT)
-          ? (imu_acq_ec == ErrorCode::OK)
-          : (yis_start_ec == ErrorCode::OK);
 
   // 启动串口桥收发任务
   static ::Application::IMUUartBridgeTask imu_bridge(
       &usart1, &i2c1, &spi1, &imu_manager, &ws2812_manager, bridge_config);
   const auto bridge_start_ec = imu_bridge.Start();
+  (void)bridge_start_ec;
 
   std::snprintf(line, sizeof(line), "[boot] wit start=%d freq=%lu stack=%lu",
                 static_cast<int>(imu_acq_ec),

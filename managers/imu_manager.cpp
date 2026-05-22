@@ -11,6 +11,8 @@ namespace Manager {
 
 using namespace LibXR;
 
+IMUManager* IMUManager::hardware_trigger_manager_ = nullptr;
+
 namespace {
 
 // JY901B 连续数据区：一次读回 acc/gyro/mag/angle/temperature。
@@ -129,11 +131,17 @@ ErrorCode IMUManager::ReadAll(IMUArrayMsg& msg) {
 
   msg = IMUArrayMsg{};
   msg.sequence = sequence_++;
+  msg.trigger_sequence = trigger_sequence_;
+  msg.trigger_mcu_tick_us = trigger_mcu_tick_us_;
+  msg.trigger_overrun_count = trigger_overrun_count_;
 
   uint8_t valid_count = 0;
   const uint8_t scan_count =
       (imu_count_ < ACTUAL_IMU_COUNT) ? imu_count_ : ACTUAL_IMU_COUNT;
   for (uint8_t i = 0; i < scan_count; ++i) {
+    if ((enabled_slots_mask_ & (1u << i)) == 0U) {
+      continue;
+    }
     if (imus_[i] == nullptr || !IsIMUOnline(i)) {
       continue;
     }
@@ -147,6 +155,7 @@ ErrorCode IMUManager::ReadAll(IMUArrayMsg& msg) {
     ConvertIMUData(raw, msg.imu_data[i]);
     ApplyQuaternionSource(i, msg.imu_data[i]);
     msg.imu_data[i].timestamp_us = Timebase::GetMicroseconds();
+    msg.imu_data[i].mcu_tick_us = msg.imu_data[i].timestamp_us;
     msg.SetValid(i, true);
     ++valid_count;
   }
@@ -210,9 +219,20 @@ ErrorCode IMUManager::StartAcquisition(
   }
 
   frequency_hz_ = config.frequency_hz;
+  enabled_slots_mask_ = BuildLeadingSlotsMask(config.enabled_imu_count);
+  use_hardware_trigger_ = config.use_hardware_trigger;
+  trigger_pending_ = false;
+  trigger_overrun_count_ = 0;
+  trigger_sequence_ = 0;
+  trigger_mcu_tick_us_ = 0;
+  while (acquisition_trigger_sem_.Wait(0U) == ErrorCode::OK) {
+  }
   // VQF 依赖采样周期 dt，频率变化后必须重建系数和状态。
   InitVQF(static_cast<float>(frequency_hz_));
   running_ = true;
+  if (use_hardware_trigger_) {
+    hardware_trigger_manager_ = this;
+  }
   acquisition_thread_.Create(this, AcquisitionThreadFunc, "IMUMgrAcq",
                              config.stack_size,
                              static_cast<Thread::Priority>(config.priority));
@@ -225,6 +245,10 @@ void IMUManager::StopAcquisition() {
   }
 
   running_ = false;
+  acquisition_trigger_sem_.Post();
+  if (hardware_trigger_manager_ == this) {
+    hardware_trigger_manager_ = nullptr;
+  }
 
   uint32_t period_ms = (frequency_hz_ > 0U) ? (1000U / frequency_hz_) : 1U;
   if (period_ms == 0U) {
@@ -236,6 +260,23 @@ void IMUManager::StopAcquisition() {
     delete data_topic_;
     data_topic_ = nullptr;
   }
+}
+
+void IMUManager::OnHardwareTriggerTimerInterrupt(bool in_isr) {
+  auto* manager = hardware_trigger_manager_;
+  if (manager == nullptr || !manager->running_ || !manager->use_hardware_trigger_) {
+    return;
+  }
+
+  if (manager->trigger_pending_) {
+    ++manager->trigger_overrun_count_;
+    return;
+  }
+
+  manager->trigger_mcu_tick_us_ = Timebase::GetMicroseconds();
+  ++manager->trigger_sequence_;
+  manager->trigger_pending_ = true;
+  manager->acquisition_trigger_sem_.PostFromCallback(in_isr);
 }
 
 bool IMUManager::IsIMUOnline(uint8_t index) const {
@@ -426,6 +467,16 @@ void IMUManager::AcquisitionThreadFunc(IMUManager* manager) {
 
   MillisecondTimestamp last_wakeup(Thread::GetTime());
   while (manager->running_) {
+    if (manager->use_hardware_trigger_) {
+      if (manager->acquisition_trigger_sem_.Wait() != ErrorCode::OK) {
+        continue;
+      }
+      if (!manager->running_) {
+        break;
+      }
+      manager->trigger_pending_ = false;
+    }
+
     // 每个周期在栈上构造一帧消息，然后直接发布给订阅者。
     IMUArrayMsg msg;
     if (manager->ReadAll(msg) == ErrorCode::OK) {
@@ -436,7 +487,9 @@ void IMUManager::AcquisitionThreadFunc(IMUManager* manager) {
     if (!manager->running_) {
       break;
     }
-    Thread::SleepUntil(last_wakeup, period_ms);
+    if (!manager->use_hardware_trigger_) {
+      Thread::SleepUntil(last_wakeup, period_ms);
+    }
   }
 }
 

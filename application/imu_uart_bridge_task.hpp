@@ -26,6 +26,7 @@ struct IMUUartBridgeConfig {
   bool stream_relative_euler = true;
   bool push_imu_euler_in_bridge = true;
   bool push_all_slots_in_bridge = true;
+  uint8_t wit_push_imu_count = Manager::ACTUAL_IMU_COUNT;
   BridgePoseSource pose_source = BridgePoseSource::WIT;
   uint32_t stream_interval_ms = 20;
   uint32_t priority = static_cast<uint32_t>(LibXR::Thread::Priority::MEDIUM);
@@ -63,6 +64,7 @@ class IMUUartBridgeTask {
   void HandleI2CWrite(uint8_t cmd, uint16_t payload_len, uint8_t sum);
   void HandleSPIWrite(uint8_t cmd, uint16_t payload_len, uint8_t sum);
   void HandleWS2812Control(uint8_t cmd, uint16_t payload_len, uint8_t sum);
+  void HandleTimeSync(uint8_t cmd, uint16_t payload_len, uint8_t sum);
   bool ReadChecksum(uint8_t expected_sum);
   uint8_t CalcSum(const uint8_t* buf, uint16_t len) const;
 

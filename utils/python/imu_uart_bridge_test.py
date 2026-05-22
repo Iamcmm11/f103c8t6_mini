@@ -3,28 +3,39 @@
 Host-side tool for the STM32 UART bridge.
 
 Run from repo root with utils/python path:
-  python utils/python/imu_uart_bridge_test.py --port COM4 ping
-  python utils/python/imu_uart_bridge_test.py --port COM4 rgb 135 206 250
-  python utils/python/imu_uart_bridge_test.py --port COM4 led 3 255 0 0
-  python utils/python/imu_uart_bridge_test.py --port COM4 off
-  python utils/python/imu_uart_bridge_test.py --port COM4 blink 135 206 250 --delay-ms 300
-  python utils/python/imu_uart_bridge_test.py --port COM4 led-blink 3 255 0 0 --delay-ms 300
-  python utils/python/imu_uart_bridge_test.py --port COM4 console
+  python utils/python/imu_uart_bridge_test.py --port COM13 ping
+  python utils/python/imu_uart_bridge_test.py --port COM13 rgb 135 206 250
+  python utils/python/imu_uart_bridge_test.py --port COM13 led 3 255 0 0
+  python utils/python/imu_uart_bridge_test.py --port COM13 off
+  python utils/python/imu_uart_bridge_test.py --port COM13 blink 135 206 250 --delay-ms 300
+  python utils/python/imu_uart_bridge_test.py --port COM13 led-blink 3 255 0 0 --delay-ms 300
+  python utils/python/imu_uart_bridge_test.py --port COM13 console
 
 Run from repo root with scripts path:
-  python scripts/imu_uart_bridge_test.py --port COM4 ping
-  python scripts/imu_uart_bridge_test.py --port COM4 rgb 135 206 250
-  python scripts/imu_uart_bridge_test.py --port COM4 led 3 255 0 0
-  python scripts/imu_uart_bridge_test.py --port COM4 off
-  python scripts/imu_uart_bridge_test.py --port COM4 blink 135 206 250 --delay-ms 300
-  python scripts/imu_uart_bridge_test.py --port COM4 led-blink 3 255 0 0 --delay-ms 300
-  python scripts/imu_uart_bridge_test.py --port COM4 console
+  python scripts/imu_uart_bridge_test.py --port /dev/ttyTCU0 ping
+  python scripts/imu_uart_bridge_test.py --port /dev/ttyTCU0 rgb 135 206 250
+  python scripts/imu_uart_bridge_test.py --port /dev/ttyTCU0 led 3 255 0 0
+  python scripts/imu_uart_bridge_test.py --port /dev/ttyTCU0 off
+  python scripts/imu_uart_bridge_test.py --port /dev/ttyTCU0 blink 135 206 250 --delay-ms 300
+  python scripts/imu_uart_bridge_test.py --port /dev/ttyTCU0 led-blink 3 255 0 0 --delay-ms 300
+  python scripts/imu_uart_bridge_test.py --port /dev/ttyTCU0 console
+
+Short soft-sync capture test:
+  mkdir -p sessions/imu_softsync_test log
+  python3 scripts/imu_uart_bridge_test.py \
+    --port /dev/ttyTCU0 \
+    --baud 115200 \
+    capture \
+    --output sessions/imu_softsync_test/imu_uart_bridge.json \
+    --sync-output log/imu_softsync_test_time_sync.csv \
+    --sync-burst-count 10
 
 """ 
 
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import math
 import os
@@ -34,7 +45,7 @@ import struct
 import sys
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Callable, Optional
 
@@ -52,6 +63,7 @@ SOF0 = 0x55
 SOF1 = 0xAA
 
 CMD_PING = 0x01
+CMD_TIME_SYNC = 0x02
 CMD_WS2812_CONTROL = 0x21
 CMD_IMU_EULER_PUSH = 0x30
 CMD_IMU_DIAG_PUSH = 0x31
@@ -68,6 +80,9 @@ IMU_PUSH_POSE_FLOAT_COUNT = 7
 IMU_PUSH_POSE_RECORD_SIZE = struct.calcsize(
     "<B" + ("f" * IMU_PUSH_POSE_FLOAT_COUNT)
 )
+IMU_PUSH_WIT_POSE_RECORD_SIZE = struct.calcsize(
+    "<B" + ("f" * IMU_PUSH_POSE_FLOAT_COUNT) + "Q"
+)
 IMU_PUSH_YIS_POSE_RECORD_SIZE = struct.calcsize(
     "<B" + ("f" * IMU_PUSH_POSE_FLOAT_COUNT) + "I"
 )
@@ -75,7 +90,6 @@ IMU_PUSH_EXTENDED_FLOAT_COUNT = 13
 IMU_PUSH_EXTENDED_RECORD_SIZE = struct.calcsize(
     "<B" + ("f" * IMU_PUSH_EXTENDED_FLOAT_COUNT)
 )
-# JSON 固定列顺序（按用户要求：0x50/0x51/0x52/0x53）
 DEFAULT_IMU_ADDR_COLUMNS = [0x50, 0x51, 0x52, 0x53]
 ANSI_RESET = "\033[0m"
 ANSI_ADDR_COLOR = {
@@ -92,6 +106,7 @@ class IMUPushRecord:
     roll_deg: float
     pitch_deg: float
     yaw_deg: float
+    mcu_tick_us: Optional[int] = None
     sample_timestamp: Optional[int] = None
     acc_x: float = math.nan
     acc_y: float = math.nan
@@ -212,6 +227,269 @@ class SyncCycleStats:
         self.host_step_max_ms = None
 
 
+@dataclass(frozen=True)
+class RXMetadata:
+    rx_wall_us: int
+    rx_monotonic_ns: int
+
+
+@dataclass(frozen=True)
+class TimeSyncSample:
+    seq: int
+    t1_nv_ns: int
+    t2_mcu_tick_us: int
+    t3_mcu_tick_us: int
+    t4_nv_ns: int
+    rtt_us: int
+    offset_us: int
+    selected: bool = False
+
+
+@dataclass(frozen=True)
+class TimeSyncMapping:
+    sample: TimeSyncSample
+    mapping_version: int
+    mono_to_wall_us: Optional[int] = None
+    frozen: bool = False
+
+
+class TimeSyncMapper:
+    def __init__(
+        self,
+        *,
+        mono_to_wall_us: Optional[int] = None,
+        frozen: bool = False,
+    ) -> None:
+        self._lock = threading.Lock()
+        self._mapping: Optional[TimeSyncMapping] = None
+        self._mono_to_wall_us = mono_to_wall_us
+        self._frozen = frozen
+
+    def update(
+        self,
+        sample: TimeSyncSample,
+        *,
+        mono_to_wall_us: Optional[int] = None,
+        frozen: Optional[bool] = None,
+    ) -> TimeSyncMapping:
+        with self._lock:
+            version = 1 if self._mapping is None else self._mapping.mapping_version + 1
+            if mono_to_wall_us is not None:
+                self._mono_to_wall_us = mono_to_wall_us
+            if frozen is not None:
+                self._frozen = frozen
+            self._mapping = TimeSyncMapping(
+                sample=sample,
+                mapping_version=version,
+                mono_to_wall_us=self._mono_to_wall_us,
+                frozen=self._frozen,
+            )
+            return self._mapping
+
+    def get(self) -> Optional[TimeSyncMapping]:
+        with self._lock:
+            return self._mapping
+
+    def map_to_wall_us(
+        self,
+        mcu_tick_us: Optional[int],
+        rx_meta: Optional[RXMetadata],
+    ) -> tuple[Optional[int], Optional[dict]]:
+        if mcu_tick_us is None:
+            return None, None
+
+        mapping = self.get()
+        if mapping is None:
+            return None, None
+
+        mono_to_wall_us = mapping.mono_to_wall_us
+        if mono_to_wall_us is None:
+            if rx_meta is None:
+                return None, None
+            mono_to_wall_us = rx_meta.rx_wall_us - (rx_meta.rx_monotonic_ns // 1000)
+        timestamp_mono_us = mcu_tick_us + mapping.sample.offset_us
+        timestamp_wall_us = timestamp_mono_us + mono_to_wall_us
+        quality = {
+            "offset_us": mapping.sample.offset_us,
+            "mcu_to_mono_offset_us": mapping.sample.offset_us,
+            "mono_to_wall_us": mono_to_wall_us,
+            "rtt_us": mapping.sample.rtt_us,
+            "sync_seq": mapping.sample.seq,
+            "mapping_version": mapping.mapping_version,
+            "time_axis": "nv_wall_us",
+            "frozen": mapping.frozen,
+        }
+        return timestamp_wall_us, quality
+
+
+def parse_time_sync_response(payload: bytes) -> tuple[int, int, int]:
+    if len(payload) == 1:
+        raise ValueError(
+            "unexpected time-sync response length: 1 "
+            f"(raw_status=0x{payload[0]:02X}, likely unknown CMD_TIME_SYNC on MCU "
+            "or MCU returned 1-byte error ACK)"
+        )
+    if len(payload) != 1 + 4 + 8 + 8:
+        raise ValueError(
+            f"unexpected time-sync response length: {len(payload)}, "
+            f"payload={payload.hex(' ')}"
+        )
+
+    status, seq, t2_mcu_tick_us, t3_mcu_tick_us = struct.unpack("<BIQQ", payload)
+    if status != STATUS_OK:
+        raise RuntimeError(f"time-sync returned error status={status}")
+    return seq, t2_mcu_tick_us, t3_mcu_tick_us
+
+
+def send_time_sync(client: "BridgeClient", seq: int) -> TimeSyncSample:
+    t1_nv_ns = time.monotonic_ns()
+    payload, rx_meta = client.request_with_rx_meta(
+        CMD_TIME_SYNC,
+        struct.pack("<I", seq & 0xFFFFFFFF),
+        timeout=1.5,
+    )
+    t4_nv_ns = rx_meta.rx_monotonic_ns
+    resp_seq, t2_mcu_tick_us, t3_mcu_tick_us = parse_time_sync_response(payload)
+    if resp_seq != (seq & 0xFFFFFFFF):
+        raise ValueError(f"time-sync seq mismatch: req={seq}, resp={resp_seq}")
+
+    rtt_us = max(0, (t4_nv_ns - t1_nv_ns) // 1000)
+    midpoint_nv_us = (t1_nv_ns + t4_nv_ns) // 2000
+    midpoint_mcu_us = (t2_mcu_tick_us + t3_mcu_tick_us) // 2
+    offset_us = int(midpoint_nv_us - midpoint_mcu_us)
+    return TimeSyncSample(
+        seq=resp_seq,
+        t1_nv_ns=t1_nv_ns,
+        t2_mcu_tick_us=t2_mcu_tick_us,
+        t3_mcu_tick_us=t3_mcu_tick_us,
+        t4_nv_ns=t4_nv_ns,
+        rtt_us=int(rtt_us),
+        offset_us=offset_us,
+    )
+
+
+class TimeSyncSession:
+    def __init__(
+        self,
+        client: "BridgeClient",
+        sync_mapper: TimeSyncMapper,
+        csv_path: str,
+        *,
+        burst_count: int,
+        interval_s: float,
+    ) -> None:
+        self._client = client
+        self._sync_mapper = sync_mapper
+        self._csv_path = csv_path
+        self._burst_count = burst_count
+        self._interval_s = interval_s
+        self._seq = 0
+        self._thread: Optional[threading.Thread] = None
+        self._stop_event = threading.Event()
+        self._csv_lock = threading.Lock()
+        self._csv_initialized = False
+        self._next_run_monotonic: Optional[float] = None
+
+    def start(self) -> None:
+        csv_dir = os.path.dirname(self._csv_path)
+        if csv_dir:
+            os.makedirs(csv_dir, exist_ok=True)
+        self._ensure_csv_initialized()
+        self._stop_event.clear()
+        self._thread = threading.Thread(target=self._run, name="time-sync", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=max(1.0, self._interval_s + 1.0))
+            self._thread = None
+
+    def run_burst(self) -> Optional[TimeSyncMapping]:
+        self._ensure_csv_initialized()
+        samples: list[TimeSyncSample] = []
+        for _ in range(self._burst_count):
+            seq = self._seq
+            self._seq += 1
+            try:
+                sample = send_time_sync(self._client, seq)
+            except TimeoutError:
+                # Missing CMD_TIME_SYNC responses are tolerated during RTT/capture tests.
+                pass
+            else:
+                samples.append(sample)
+            if self._stop_event.is_set():
+                break
+            time.sleep(0.01)
+
+        self._next_run_monotonic = time.monotonic() + self._interval_s
+        if not samples:
+            return None
+
+        selected_index = min(range(len(samples)), key=lambda idx: samples[idx].rtt_us)
+        mapping: Optional[TimeSyncMapping] = None
+        for idx, sample in enumerate(samples):
+            selected_sample = replace(sample, selected=(idx == selected_index))
+            if selected_sample.selected:
+                mapping = self._sync_mapper.update(selected_sample)
+            self._append_csv_row(selected_sample)
+        return mapping
+
+    def _run(self) -> None:
+        while not self._stop_event.is_set():
+            if self._next_run_monotonic is not None:
+                while not self._stop_event.is_set() and time.monotonic() < self._next_run_monotonic:
+                    time.sleep(0.1)
+                if self._stop_event.is_set():
+                    break
+            try:
+                self.run_burst()
+            except Exception as exc:
+                print(f"[bridge] time-sync error: {exc}", file=sys.stderr, flush=True)
+
+    def _write_csv_header(self) -> None:
+        csv_dir = os.path.dirname(self._csv_path)
+        if csv_dir:
+            os.makedirs(csv_dir, exist_ok=True)
+        with self._csv_lock:
+            with open(self._csv_path, "w", encoding="utf-8", newline="") as csv_file:
+                writer = csv.writer(csv_file)
+                writer.writerow(
+                    [
+                        "seq",
+                        "t1_nv_ns",
+                        "t2_mcu_tick_us",
+                        "t3_mcu_tick_us",
+                        "t4_nv_ns",
+                        "rtt_us",
+                        "offset_us",
+                        "selected",
+                    ]
+                )
+        self._csv_initialized = True
+
+    def _ensure_csv_initialized(self) -> None:
+        if not self._csv_initialized:
+            self._write_csv_header()
+
+    def _append_csv_row(self, sample: TimeSyncSample) -> None:
+        with self._csv_lock:
+            with open(self._csv_path, "a", encoding="utf-8", newline="") as csv_file:
+                writer = csv.writer(csv_file)
+                writer.writerow(
+                    [
+                        sample.seq,
+                        sample.t1_nv_ns,
+                        sample.t2_mcu_tick_us,
+                        sample.t3_mcu_tick_us,
+                        sample.t4_nv_ns,
+                        sample.rtt_us,
+                        sample.offset_us,
+                        1 if sample.selected else 0,
+                    ]
+                )
+
+
 def calc_sum(data: bytes) -> int:
     return sum(data) & 0xFF
 
@@ -228,6 +506,10 @@ def build_frame(cmd: int, payload: bytes) -> bytes:
     )
     checksum = (calc_sum(header) + calc_sum(payload)) & 0xFF
     return header + payload + bytes([checksum])
+
+
+def format_hex_bytes(data: bytes) -> str:
+    return data.hex(" ")
 
 
 def parse_byte(text: str) -> int:
@@ -300,6 +582,94 @@ def format_addr_with_color(addr: int) -> str:
     return f"{color}{text}{ANSI_RESET}"
 
 
+def _round_or_none(value: float, digits: int = 2) -> Optional[float]:
+    if math.isnan(value):
+        return None
+    return round(value, digits)
+
+
+def format_imu_json_row(
+    ts_unix_ms: int,
+    imu_records: list[IMUPushRecord],
+    rx_meta: Optional[RXMetadata] = None,
+    sync_mapper: Optional[TimeSyncMapper] = None,
+) -> dict:
+    imus: list[dict] = []
+
+    for record in imu_records:
+        tick = record.mcu_tick_us
+        if tick is None and record.sample_timestamp is not None:
+            tick = record.sample_timestamp
+
+        timestamp_us = None
+        sync_quality = None
+        if sync_mapper is not None:
+            timestamp_us, sync_quality = sync_mapper.map_to_wall_us(tick, rx_meta)
+
+        imu = {
+            "addr": f"0x{record.imu_addr:02X}",
+        }
+        if timestamp_us is not None:
+            imu["timestamp_us"] = timestamp_us
+            if rx_meta is not None:
+                imu["rx_delay_us"] = rx_meta.rx_wall_us - timestamp_us
+        if record.mcu_tick_us is not None:
+            imu["mcu_tick_us"] = record.mcu_tick_us
+        if record.sample_timestamp is not None:
+            imu["sample_timestamp"] = record.sample_timestamp
+        if sync_quality is not None:
+            sync_version = sync_quality.get("mapping_version")
+            if sync_version is not None:
+                imu["sync_version"] = sync_version
+
+        rpy_deg = {
+            "roll": _round_or_none(record.roll_deg),
+            "pitch": _round_or_none(record.pitch_deg),
+            "yaw": _round_or_none(record.yaw_deg),
+        }
+        rpy_deg = {key: value for key, value in rpy_deg.items() if value is not None}
+        if rpy_deg:
+            imu["rpy_deg"] = rpy_deg
+
+        if record.has_quaternion():
+            quat = {
+                "w": _round_or_none(record.quat_w, 4),
+                "x": _round_or_none(record.quat_x, 4),
+                "y": _round_or_none(record.quat_y, 4),
+                "z": _round_or_none(record.quat_z, 4),
+            }
+            imu["quat"] = {key: value for key, value in quat.items() if value is not None}
+
+        if record.has_motion_data():
+            acc = {
+                "x": _round_or_none(record.acc_x),
+                "y": _round_or_none(record.acc_y),
+                "z": _round_or_none(record.acc_z),
+            }
+            gyro = {
+                "x": _round_or_none(record.gyro_x),
+                "y": _round_or_none(record.gyro_y),
+                "z": _round_or_none(record.gyro_z),
+            }
+            acc = {key: value for key, value in acc.items() if value is not None}
+            gyro = {key: value for key, value in gyro.items() if value is not None}
+            if acc:
+                imu["acc"] = acc
+            if gyro:
+                imu["gyro"] = gyro
+
+        imus.append(imu)
+
+    row: dict = {
+        "ts_iso": datetime.fromtimestamp(ts_unix_ms / 1000.0).isoformat(timespec="milliseconds"),
+        "imus": imus,
+    }
+    if rx_meta is not None:
+        row["rx_timestamp_us"] = rx_meta.rx_wall_us
+
+    return row
+
+
 class BridgeClient:
     def __init__(
         self,
@@ -310,7 +680,7 @@ class BridgeClient:
         print_imu: bool = True,
         imu_print_hz: float = 10.0,
         imu_record_callback: Optional[
-            Callable[[int, list[IMUPushRecord]], None]
+            Callable[[int, list[IMUPushRecord], RXMetadata], None]
         ] = None,
     ) -> None:
         self._port = port
@@ -331,13 +701,14 @@ class BridgeClient:
         self._last_imu_line_len = 0
         self._response_queues = {
             CMD_PING: queue.Queue(),
+            CMD_TIME_SYNC: queue.Queue(),
             CMD_WS2812_CONTROL: queue.Queue(),
         }
 
     def set_imu_record_callback(
         self,
         callback: Optional[
-            Callable[[int, list[IMUPushRecord]], None]
+            Callable[[int, list[IMUPushRecord], RXMetadata], None]
         ],
     ) -> None:
         self._imu_record_callback = callback
@@ -380,6 +751,15 @@ class BridgeClient:
             self._serial = None
 
     def request(self, cmd: int, payload: bytes, timeout: float = 1.5) -> bytes:
+        resp, _rx_meta = self.request_with_rx_meta(cmd, payload, timeout)
+        return resp
+
+    def request_with_rx_meta(
+        self,
+        cmd: int,
+        payload: bytes,
+        timeout: float = 1.5,
+    ) -> tuple[bytes, RXMetadata]:
         if self._serial is None:
             raise RuntimeError("serial port is not open")
 
@@ -397,9 +777,15 @@ class BridgeClient:
                 self._serial.flush()
 
             try:
-                return resp_queue.get(timeout=timeout)
+                resp = resp_queue.get(timeout=timeout)
             except queue.Empty as exc:
                 raise TimeoutError(f"timeout waiting for response to cmd=0x{cmd:02X}") from exc
+            if isinstance(resp, tuple):
+                return resp
+            return resp, RXMetadata(
+                rx_wall_us=time.time_ns() // 1000,
+                rx_monotonic_ns=time.monotonic_ns(),
+            )
 
     def _read_exact(self, size: int, timeout: Optional[float] = None) -> Optional[bytes]:
         if self._serial is None:
@@ -487,8 +873,13 @@ class BridgeClient:
                 del rx_buf[0]
                 continue
 
+            rx_meta = RXMetadata(
+                rx_wall_us=time.time_ns() // 1000,
+                rx_monotonic_ns=time.monotonic_ns(),
+            )
+            frame = bytes(rx_buf[:total_len])
             del rx_buf[:total_len]
-            self._dispatch_frame(cmd, payload)
+            self._dispatch_frame(cmd, payload, rx_meta)
 
     def _read_frame(self) -> Optional[tuple[int, bytes]]:
         if self._serial is None:
@@ -532,18 +923,23 @@ class BridgeClient:
 
         return None
 
-    def _dispatch_frame(self, cmd: int, payload: bytes) -> None:
+    def _dispatch_frame(
+        self,
+        cmd: int,
+        payload: bytes,
+        rx_meta: RXMetadata,
+    ) -> None:
         if cmd == CMD_IMU_EULER_PUSH:
-            self._handle_imu_push(payload)
+            self._handle_imu_push(payload, rx_meta)
             return
         if cmd == CMD_IMU_DIAG_PUSH:
             self._handle_imu_diag_push(payload)
             return
 
         resp_queue = self._response_queues.setdefault(cmd, queue.Queue())
-        resp_queue.put(payload)
+        resp_queue.put((payload, rx_meta))
 
-    def _handle_imu_push(self, payload: bytes) -> None:
+    def _handle_imu_push(self, payload: bytes, rx_meta: RXMetadata) -> None:
         imu_records = self._parse_imu_push(payload)
         if imu_records is None:
             print(
@@ -555,9 +951,9 @@ class BridgeClient:
 
         callback = self._imu_record_callback
         if callback is not None and imu_records:
-            ts_unix_ms = int(time.time() * 1000)
+            ts_unix_ms = rx_meta.rx_wall_us // 1000
             try:
-                callback(ts_unix_ms, imu_records)
+                callback(ts_unix_ms, imu_records, rx_meta)
             except Exception as exc:
                 print(f"[bridge] imu record callback error: {exc}", file=sys.stderr, flush=True)
 
@@ -590,6 +986,8 @@ class BridgeClient:
                     parts.append(
                         f"quat=({record.quat_w:.4f},{record.quat_x:.4f},{record.quat_y:.4f},{record.quat_z:.4f})"
                     )
+                if record.mcu_tick_us is not None:
+                    parts.append(f"mcu_tick_us={record.mcu_tick_us}")
             line = ",".join(parts)
             self._print_imu_single_line(line)
 
@@ -627,6 +1025,7 @@ class BridgeClient:
         if record_size not in (
             IMU_PUSH_LEGACY_RECORD_SIZE,
             IMU_PUSH_POSE_RECORD_SIZE,
+            IMU_PUSH_WIT_POSE_RECORD_SIZE,
             IMU_PUSH_YIS_POSE_RECORD_SIZE,
             IMU_PUSH_EXTENDED_RECORD_SIZE,
         ):
@@ -663,6 +1062,23 @@ class BridgeClient:
                 quat_x=values[5],
                 quat_y=values[6],
                 quat_z=values[7],
+            )
+
+        if len(payload) == IMU_PUSH_WIT_POSE_RECORD_SIZE:
+            values = struct.unpack(
+                "<B" + ("f" * IMU_PUSH_POSE_FLOAT_COUNT) + "Q",
+                payload,
+            )
+            return IMUPushRecord(
+                imu_addr=values[0],
+                roll_deg=values[1],
+                pitch_deg=values[2],
+                yaw_deg=values[3],
+                quat_w=values[4],
+                quat_x=values[5],
+                quat_y=values[6],
+                quat_z=values[7],
+                mcu_tick_us=values[8],
             )
 
         if len(payload) == IMU_PUSH_YIS_POSE_RECORD_SIZE:
@@ -978,7 +1394,11 @@ def cmd_sync_monitor(client: BridgeClient, _args: argparse.Namespace) -> int:
     print("Sync-monitor mode started. Waiting for sample_timestamp resets, press Ctrl+C to stop.")
     sync_states: dict[int, SyncCycleStats] = {}
 
-    def _record(ts_unix_ms: int, imu_records: list[IMUPushRecord]) -> None:
+    def _record(
+        ts_unix_ms: int,
+        imu_records: list[IMUPushRecord],
+        _rx_meta: RXMetadata,
+    ) -> None:
         for record in imu_records:
             if record.sample_timestamp is None:
                 continue
@@ -1014,11 +1434,54 @@ def cmd_sync_monitor(client: BridgeClient, _args: argparse.Namespace) -> int:
         client.set_imu_record_callback(None)
 
 
+def cmd_sync(client: BridgeClient, args: argparse.Namespace) -> int:
+    samples: list[TimeSyncSample] = []
+    error_count = 0
+    for seq in range(args.count):
+        try:
+            sample = send_time_sync(client, seq)
+        except TimeoutError:
+            error_count += 1
+        except (ValueError, RuntimeError) as exc:
+            error_count += 1
+            print(f"sync error seq={seq}: {exc}", file=sys.stderr, flush=True)
+        else:
+            samples.append(sample)
+            print(
+                f"sync seq={sample.seq} "
+                f"t2={sample.t2_mcu_tick_us} "
+                f"t3={sample.t3_mcu_tick_us} "
+                f"rtt_us={sample.rtt_us} "
+                f"offset_us={sample.offset_us}"
+            )
+        if seq + 1 < args.count:
+            time.sleep(args.interval_s)
+
+    if samples:
+        best = min(samples, key=lambda item: item.rtt_us)
+        print(
+            f"best seq={best.seq} "
+            f"rtt_us={best.rtt_us} "
+            f"offset_us={best.offset_us}"
+        )
+    print(f"sync summary: ok={len(samples)} error={error_count} requested={args.count}")
+    return 0
+
+
 def cmd_capture(client: BridgeClient, args: argparse.Namespace) -> int:
     output_path = os.path.abspath(args.output)
     output_dir = os.path.dirname(output_path)
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
+    sync_path = os.path.abspath(args.sync_output)
+    sync_mapper = TimeSyncMapper()
+    sync_session = TimeSyncSession(
+        client,
+        sync_mapper,
+        sync_path,
+        burst_count=args.sync_burst_count,
+        interval_s=args.sync_interval_s,
+    )
 
     stop_event = threading.Event()
 
@@ -1031,73 +1494,44 @@ def cmd_capture(client: BridgeClient, args: argparse.Namespace) -> int:
     signal.signal(signal.SIGTERM, _handle_signal)
 
     try:
+        initial_mapping = sync_session.run_burst()
+        if initial_mapping is not None:
+            print(
+                f"time-sync ready: seq={initial_mapping.sample.seq}, "
+                f"rtt_us={initial_mapping.sample.rtt_us}, "
+                f"offset_us={initial_mapping.sample.offset_us}"
+            )
+        else:
+            print(
+                "time-sync warning: initial burst produced no valid mapping; "
+                "timestamp_us will remain null until sync succeeds",
+                file=sys.stderr,
+                flush=True,
+            )
+        if args.sync_interval_s > 0.0:
+            sync_session.start()
+            print(
+                f"time-sync periodic enabled: interval_s={args.sync_interval_s}, "
+                f"burst_count={args.sync_burst_count}"
+            )
+        else:
+            print("time-sync periodic disabled: using initial mapping only")
         with open(output_path, "w", encoding="utf-8", buffering=1) as f:
             f.write("[\n")
             first_row = True
 
-            def _round_or_none(value: float, digits: int = 2) -> Optional[float]:
-                if math.isnan(value):
-                    return None
-                return round(value, digits)
-
-            def _record(ts_unix_ms: int, imu_records: list[IMUPushRecord]) -> None:
+            def _record(
+                ts_unix_ms: int,
+                imu_records: list[IMUPushRecord],
+                rx_meta: RXMetadata,
+            ) -> None:
                 nonlocal first_row
-                poses_by_addr = {}
-                acc_by_addr = {}
-                gyro_by_addr = {}
-                quaternion_by_addr = {}
-                sample_timestamp_by_addr = {}
-                for record in imu_records:
-                    key = f"0x{record.imu_addr:02X}"
-                    poses_by_addr[key] = {
-                        "roll_X": round(record.roll_deg, 2),
-                        "pitch_Y": round(record.pitch_deg, 2),
-                        "yaw_Z": round(record.yaw_deg, 2),
-                    }
-                    acc_by_addr[key] = {
-                        "x": _round_or_none(record.acc_x),
-                        "y": _round_or_none(record.acc_y),
-                        "z": _round_or_none(record.acc_z),
-                    }
-                    gyro_by_addr[key] = {
-                        "x": _round_or_none(record.gyro_x),
-                        "y": _round_or_none(record.gyro_y),
-                        "z": _round_or_none(record.gyro_z),
-                    }
-                    quaternion_by_addr[key] = {
-                        "w": _round_or_none(record.quat_w, 4),
-                        "x": _round_or_none(record.quat_x, 4),
-                        "y": _round_or_none(record.quat_y, 4),
-                        "z": _round_or_none(record.quat_z, 4),
-                    }
-                    sample_timestamp_by_addr[key] = record.sample_timestamp
-
-                row = {
-                    "ts_iso": datetime.fromtimestamp(ts_unix_ms / 1000.0).isoformat(timespec="milliseconds"),
-                    "poses_by_addr": {},
-                    "acc_by_addr": {},
-                    "gyro_by_addr": {},
-                    "quaternion_by_addr": {},
-                    "sample_timestamp_by_addr": {},
-                }
-
-                # 固定列顺序，便于逐行对比同一地址的数据变化。
-                for addr in DEFAULT_IMU_ADDR_COLUMNS:
-                    key = f"0x{addr:02X}"
-                    row["poses_by_addr"][key] = poses_by_addr.get(key)
-                    row["acc_by_addr"][key] = acc_by_addr.get(key)
-                    row["gyro_by_addr"][key] = gyro_by_addr.get(key)
-                    row["quaternion_by_addr"][key] = quaternion_by_addr.get(key)
-                    row["sample_timestamp_by_addr"][key] = sample_timestamp_by_addr.get(key)
-
-                # 追加非默认地址，避免丢信息。
-                for key in sorted(poses_by_addr.keys()):
-                    if key not in row["poses_by_addr"]:
-                        row["poses_by_addr"][key] = poses_by_addr[key]
-                        row["acc_by_addr"][key] = acc_by_addr.get(key)
-                        row["gyro_by_addr"][key] = gyro_by_addr.get(key)
-                        row["quaternion_by_addr"][key] = quaternion_by_addr.get(key)
-                        row["sample_timestamp_by_addr"][key] = sample_timestamp_by_addr.get(key)
+                row = format_imu_json_row(
+                    ts_unix_ms,
+                    imu_records,
+                    rx_meta,
+                    sync_mapper=sync_mapper,
+                )
 
                 if not first_row:
                     f.write(",\n")
@@ -1114,6 +1548,8 @@ def cmd_capture(client: BridgeClient, args: argparse.Namespace) -> int:
             f.write("]\n")
             f.flush()
     finally:
+        client.set_imu_record_callback(None)
+        sync_session.stop()
         signal.signal(signal.SIGINT, old_sigint)
         signal.signal(signal.SIGTERM, old_sigterm)
 
@@ -1200,6 +1636,24 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sync_monitor_parser.set_defaults(func=cmd_sync_monitor)
 
+    sync_parser = subparsers.add_parser(
+        "sync",
+        help="send NV-MCU time-sync requests and print raw four-timestamp results",
+    )
+    sync_parser.add_argument(
+        "--count",
+        type=int,
+        default=10,
+        help="number of time-sync requests to send",
+    )
+    sync_parser.add_argument(
+        "--interval-s",
+        type=float,
+        default=0.2,
+        help="delay between time-sync requests in seconds",
+    )
+    sync_parser.set_defaults(func=cmd_sync)
+
     capture_parser = subparsers.add_parser(
         "capture",
         help="background capture mode, write IMU pushes to JSON",
@@ -1208,6 +1662,23 @@ def build_parser() -> argparse.ArgumentParser:
         "--output",
         required=True,
         help="output JSON path",
+    )
+    capture_parser.add_argument(
+        "--sync-output",
+        default="log/imu_time_sync.csv",
+        help="output CSV path for raw time-sync samples",
+    )
+    capture_parser.add_argument(
+        "--sync-interval-s",
+        type=float,
+        default=0.0,
+        help="period between time-sync bursts in seconds; <=0 disables periodic sync",
+    )
+    capture_parser.add_argument(
+        "--sync-burst-count",
+        type=int,
+        default=10,
+        help="number of sync requests per burst, best low-RTT sample is selected",
     )
     capture_parser.set_defaults(func=cmd_capture)
 
@@ -1219,7 +1690,7 @@ def main() -> int:
     args = parser.parse_args()
 
     try:
-        print_imu = args.command not in {"capture", "sync-monitor"}
+        print_imu = args.command not in {"capture", "sync", "sync-monitor"}
         with BridgeClient(
             args.port,
             args.baud,
