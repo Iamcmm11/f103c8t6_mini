@@ -3,7 +3,6 @@
 #include "cdc_uart.hpp"
 #include "libxr.hpp"
 #include "main.h"
-#include "tim.h"
 #include "stm32_adc.hpp"
 #include "stm32_can.hpp"
 #include "stm32_canfd.hpp"
@@ -41,7 +40,7 @@ extern "C" void app_on_tim6_period_elapsed(void) {
 
 namespace {
 
-constexpr bool kEnableUart5LogPush = false;
+constexpr bool kEnableUart5LogPush = true;  //开启关闭串口5的阻塞形式的日志输出
 
 void Uart5Print(const char* text) {
   if (!kEnableUart5LogPush) {
@@ -81,6 +80,7 @@ uint32_t GetTim5ClockHz() {
 extern I2C_HandleTypeDef hi2c1;
 extern SPI_HandleTypeDef hspi1;
 extern TIM_HandleTypeDef htim1;
+extern TIM_HandleTypeDef htim2;
 extern TIM_HandleTypeDef htim5;
 extern TIM_HandleTypeDef htim6;
 extern UART_HandleTypeDef huart1;
@@ -89,7 +89,7 @@ extern UART_HandleTypeDef huart5;
 /* DMA Resources */
 static uint8_t spi1_tx_buf[768];
 static uint8_t usart1_tx_buf[512];
-static uint8_t usart1_rx_buf[256];
+static uint8_t usart1_rx_buf[128];
 static uint8_t i2c1_buf[96];
 
 extern "C" void app_main(void) {
@@ -105,9 +105,16 @@ extern "C" void app_main(void) {
   STM32PowerManager power_manager;
 
   /* GPIO Configuration */
+  STM32GPIO PA1(GPIOA, GPIO_PIN_1, EXTI1_IRQn);
+  STM32GPIO PA15(GPIOA, GPIO_PIN_15);
   STM32GPIO PA4(GPIOA, GPIO_PIN_4);
   STM32GPIO PA6(GPIOA, GPIO_PIN_6, EXTI9_5_IRQn);
+  STM32GPIO PB3(GPIOB, GPIO_PIN_3);
+  STM32GPIO PB4(GPIOB, GPIO_PIN_4);
+  STM32GPIO PC10(GPIOC, GPIO_PIN_10);
 
+
+  STM32PWM pwm_tim2_ch3(&htim2, TIM_CHANNEL_3, false);
 
   STM32PWM pwm_tim5_ch1(&htim5, TIM_CHANNEL_1, false);
 
@@ -198,10 +205,10 @@ extern "C" void app_main(void) {
   wit_acq_config.priority = static_cast<uint32_t>(LibXR::Thread::Priority::HIGH);
   wit_acq_config.stack_size = 2048;
   wit_acq_config.use_hardware_trigger = true;
-  // 1 => only 0x50, 2 => 0x50+0x51, 3 => 0x50+0x51+0x52, 4 => 0x50~0x53.
-  wit_acq_config.enabled_imu_count = 1;
+  // 1 => only 0x50, 6 => 0x50~0x55.
+  wit_acq_config.enabled_imu_count = 6;
 
-  // YIS acquisition config: 50Hz, topic "yis_imu_pose",
+  // YIS acquisition config: 200Hz, topic "yis_imu_pose",
   // medium priority, 1024-byte stack.
   ::Application::YISIMUAcquisitionConfig yis_config;
   yis_config.frequency_hz = 200;
@@ -209,16 +216,17 @@ extern "C" void app_main(void) {
   yis_config.stack_size = 1024;
   yis_config.dr_wait_timeout_ms = 20;
   yis_config.topic_name = "yis_imu_pose";
-  static ::Application::YISIMUAcquisitionTask yis_task(&yis_imu, yis_config, &PA6);
+  static ::Application::YISIMUAcquisitionTask yis_task(&yis_imu, yis_config, &PA1);
 
   // Bridge config: 20ms push period, medium priority, 1024-byte stack.
   // Select bridge pose source here: WIT or YIS.
   ::Application::IMUUartBridgeConfig bridge_config;
-  bridge_config.stream_relative_euler = false;
-  bridge_config.push_imu_euler_in_bridge = true;
-  bridge_config.pose_source = ::Application::BridgePoseSource::WIT;
-  bridge_config.push_all_slots_in_bridge = false;
-  bridge_config.stream_interval_ms = 20;
+  bridge_config.stream_relative_euler = false;    //字符流输出
+  bridge_config.push_imu_euler_in_bridge = true;  //是否主动向 UART 推送姿态数据
+  bridge_config.pose_source = ::Application::BridgePoseSource::YIS;
+  bridge_config.push_all_slots_in_bridge = false; //WIT 多 IMU 推送时，是否把无效槽位也打包进去
+  bridge_config.wit_push_imu_count = wit_acq_config.enabled_imu_count;
+  bridge_config.stream_interval_ms = 0;
   bridge_config.priority = static_cast<uint32_t>(LibXR::Thread::Priority::MEDIUM);
   bridge_config.stack_size = 1024;
 
@@ -238,7 +246,6 @@ extern "C" void app_main(void) {
   if (yis_init_ec == ErrorCode::OK) {
     yis_start_ec = yis_task.Start();
   }
-
 
   // 启动串口桥收发任务
   static ::Application::IMUUartBridgeTask imu_bridge(

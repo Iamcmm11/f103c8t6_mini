@@ -1,392 +1,297 @@
-# IMU UART MCU 时间同步方案
+# WIT UART MCU 时间同步方案
 
 ## 目的
 
-本文档用于记录外部 IMU/MCU 与 NV/SOC 之间的时间对齐方案。
+本文档记录当前已经落地的 WIT MCU-NV 时间同步方案，以及最终对外的数据时间轴口径。
 
-当前目标是先形成可评审的设计口径，不直接修改采集代码。后续实现时，再根据 MCU 固件能力和串口协议约束落到具体包格式。
+本文档描述的是当前实现，不再保留旧的“执行计划”内容。
 
-核心目标：
+## 当前实现总览
 
-- 让外部 IMU 数据具备可对齐的视频时间戳，而不是依赖 NV 收包时刻或其它模组兼容字段。
-- 让 IMU 数据可以和视频帧 `wall_us` / SEI 时间戳在同一 SOC 时间轴上对齐。
-- 保留 NV 收包时间，用于诊断串口传输、Linux 调度和 MCU 排队造成的延迟。
+当前链路分为四段：
 
-## 当前问题
+1. STM32 用硬件定时触发 WIT 采集。
+2. STM32 为每个 WIT 样本打 `mcu_tick_us`。
+3. STM32 通过 UART bridge 持续推送压缩后的 IMU 数据。
+4. NV 侧通过 `CMD_TIME_SYNC=0x02` 周期性对时，把 `mcu_tick_us` 映射到最终的 `timestamp_us`。
 
-当前外部 IMU/MCU 同步方案不应依赖 `ts_iso`。
+当前 WIT 不是“传感器内部被外部同步脉冲锁相”的方案，而是：
 
-说明：
+- MCU 侧采集节拍由硬件定时器控制。
+- 多个 WIT 仍然是顺序 I2C 读取。
+- 每个 IMU 记录各自的 MCU 本地时间戳。
 
-- `ts_iso` 是接收脚本为兼容另一个 IMU 模组时可能生成的字段。
-- 本方案讨论的外部 IMU 数据流可以没有 `ts_iso`。
-- 即使后续兼容层写出 `ts_iso`，它也只应被视为 NV 侧接收/解析时间，不是 IMU 真实采样时间。
+因此当前 `mcu_tick_us` 的语义是“MCU 侧读出该 IMU 数据时刻附近的本地单调时间”，不是 WIT 芯片内部原生采样时刻。
 
-相关语义是：
+## MCU 侧方案
 
-- 外部 IMU/MCU 持续向 NV 推送数据。
-- NV 开始采集后打开 UART 接收和记录。
-- 如果只在 NV 侧给数据打接收时间戳，这个时间更接近“NV 用户态收到并解析到这一包的时间”。
-- NV 接收时间不是 IMU 的真实采样时刻，也不是 MCU 读取 IMU 数据时刻。
+### 1. 采集触发
 
-因此，不能把 NV 接收时间直接当作 IMU 采样时间去对齐视频。这样会包含以下不确定延迟：
+当前 `app_main.cpp` 中：
 
-- IMU 采样到 MCU 读取的延迟。
-- MCU 内部打包、排队和发送延迟。
-- UART 线上传输时间。
-- Linux 串口驱动和用户态调度延迟。
-- Python 解析和回调调度延迟。
+- `wit_acq_config.use_hardware_trigger = true`
+- `HAL_TIM_Base_Start_IT(&htim6)`
+- `TIM6` 周期回调里调用 `Manager::IMUManager::OnHardwareTriggerTimerInterrupt(true)`
 
-这些延迟可能大体稳定，但不能直接假设完全固定。尤其在系统负载变化、串口 buffer 堆积、MCU 主循环被其它任务打断时，延迟会出现抖动。
+也就是说，WIT 采集线程不是靠 `SleepUntil()` 自由轮询，而是由 `TIM6` 中断驱动。
 
-## 方案概述
+### 2. 采集线程与触发元数据
 
-建议采用类似 NTP 的四时间戳模型，在 NV 与 MCU 之间周期性做轻量对时。
+`IMUManager` 内部维护以下触发信息：
 
-同步后，MCU 每条 IMU 样本都携带本地时间戳 `mcu_tick`。NV 维护一个从 MCU 本地时间到 NV/SOC 时间的线性映射：
+- `trigger_sequence`
+- `trigger_mcu_tick_us`
+- `trigger_overrun_count`
 
-```text
-nv_time_us = a * mcu_tick + b
-```
+每次硬件触发到来时：
+
+- 记录一次 MCU 本地单调时间
+- 增加触发序号
+- 唤醒采集线程
+
+随后采集线程执行 `ReadAll()`，生成一帧 `IMUArrayMsg`。
+
+### 3. 每个 IMU 的时间戳
+
+当前 `ReadAll()` 中，WIT 每个槽位在读完并转换完成后写入：
+
+- `imu_data[i].timestamp_us = Timebase::GetMicroseconds()`
+- `imu_data[i].mcu_tick_us = imu_data[i].timestamp_us`
+
+当前实现里，这两个字段在 MCU 侧数值相同，都是 STM32 本地微秒单调时钟。
+
+因此：
+
+- `timestamp_us`：MCU 本地时间
+- `mcu_tick_us`：MCU 本地时间
+
+在 MCU 侧它们还不是 NV/SOC 时间轴。
+
+### 4. 多 IMU 的时间关系
+
+当前 WIT 是顺序 I2C 读取 6 路：
+
+- `0x50`
+- `0x51`
+- `0x52`
+- `0x53`
+- `0x54`
+- `0x55`
+
+因此不能把一整包只看成一个统一采样时刻。当前实现已经保留了每个 IMU 各自的 `mcu_tick_us`。
+
+## UART bridge 推送格式
+
+### 1. Push 命令号
+
+WIT push 走 `CMD_IMU_EULER_PUSH = 0x30`。
+
+### 2. 当前 WIT 紧凑格式
+
+当前 WIT push 使用紧凑格式：
+
+- Header: `<BQ>`
+  - `imu_count: uint8`
+  - `base_tick_us: uint64`
+- Record: `<B H hhh hhhh>`
+  - `imu_addr: uint8`
+  - `tick_delta_us: uint16`
+  - `acc_x_mg, acc_y_mg, acc_z_mg: int16`
+  - `quat_w_q15, quat_x_q15, quat_y_q15, quat_z_q15: int16`
+
+NV 侧收到后重建：
+
+- `record.mcu_tick_us = base_tick_us + tick_delta_us`
+
+注意：
+
+- 当前紧凑 push 不再直接携带 RPY 浮点角度。
+- 当前主要携带的是地址、MCU 时间、加速度、四元数。
+
+## NV 侧时间同步方案
+
+## 1. 对时命令
+
+NV 侧通过 `CMD_TIME_SYNC = 0x02` 发起对时。
+
+请求：
+
+- payload: `seq: uint32`
+
+MCU 回复：
+
+- `status`
+- `seq`
+- `t2_mcu_tick_us`
+- `t3_mcu_tick_us`
 
 其中：
 
-- `mcu_tick`：MCU 本地单调计数，建议由硬件 timer 提供。
-- `a`：MCU tick 到微秒的比例系数，同时可包含频率漂移修正。
-- `b`：MCU 时间轴映射到 NV 时间轴的偏移。
-- `nv_time_us`：换算后的 NV/SOC 时间，后续用于和视频帧对齐。
+- `t2_mcu_tick_us`：MCU 读完完整 sync 请求后的本地时间
+- `t3_mcu_tick_us`：MCU 发出 sync 回复前的本地时间
 
-初版可以先固定 `a` 为 MCU 标称 tick 频率，只估计 `b`。如果长时间测试发现漂移明显，再用多轮同步样本拟合 `a` 和 `b`。
+### 2. 四时间戳模型
+
+一次对时交互的四个时间戳是：
+
+- `t1_nv_ns`：NV 发送 sync 请求前的单调时钟
+- `t2_mcu_tick_us`：MCU 收到请求后的本地时钟
+- `t3_mcu_tick_us`：MCU 发送回复前的本地时钟
+- `t4_nv_ns`：NV 收到回复后的单调时钟
+
+NV 侧当前计算：
+
+```text
+rtt_us = (t4_nv_ns - t1_nv_ns) / 1000
+midpoint_nv_us = (t1_nv_ns + t4_nv_ns) / 2000
+midpoint_mcu_us = (t2_mcu_tick_us + t3_mcu_tick_us) / 2
+offset_us = midpoint_nv_us - midpoint_mcu_us
+```
+
+当前实现中，`mcu_tick_us` 已经是 MCU 微秒时间，所以当前没有再拟合比例项 `a`，默认斜率为 1。
+
+### 3. 样本选择
+
+一轮 burst 会发多次 sync 请求。当前 NV 侧选择：
+
+- RTT 最小的那一条样本
+
+并把它作为当前有效映射。
+
+当前输出到同步 CSV 的核心字段有：
+
+- `seq`
+- `t1_nv_ns`
+- `t2_mcu_tick_us`
+- `t3_mcu_tick_us`
+- `t4_nv_ns`
+- `rtt_us`
+- `offset_us`
+- `selected`
 
 ## 时间轴约束
 
-本方案里有两类时间轴，必须在实现时明确区分：
+当前文档里的“时间轴约束”分两层：
 
-- 同步计算内部时间轴：NV 侧建议使用 `CLOCK_MONOTONIC_RAW` 或等价单调时钟，避免 wall clock 被 NTP/PTP/系统校时调整。
-- 对外数据时间轴：最终写入 IMU JSON 的 `timestamp_us` 必须和视频 `wall_us` / SEI 时间戳处在同一个 SOC 时间轴上。
+- 同步计算内部时间轴：NV/SOC 的单调时钟轴
+- 最终对外对齐时间轴：NV/SOC wall_us 轴
 
-如果视频侧 `wall_us` 本身就是 Unix wall clock 微秒时间，而同步内部使用 `CLOCK_MONOTONIC_RAW`，则不能直接用 `imu.timestamp_us - video_t0_us`。此时 NV 侧需要在采集开始时建立一组本地桥接关系，例如：
+### 1. 同步计算内部时间轴
 
-```text
-mono_raw_t0_ns = clock_gettime(CLOCK_MONOTONIC_RAW)
-wall_t0_us     = clock_gettime(CLOCK_REALTIME) 或视频模块提供的 wall_us
-```
+代码里当前用的是 `time.monotonic_ns()`，不是 wall clock。
 
-然后把由 `mcu_tick` 映射得到的 monotonic 时间换算到视频使用的 `wall_us` 轴，或者反过来让视频侧也输出 monotonic 时间。总原则是：视频和 IMU 对齐计算只能在同一时间轴上进行。
+同步 CSV 里的：
 
-## 四时间戳同步协议
+- `t1_nv_ns`
+- `t4_nv_ns`
+- `offset_us`
 
-一次同步交互记录四个时间戳：
+都是在这条轴上算的。
 
-```text
-NV  发送 sync 请求前: t1_nv_ns
-MCU 收到 sync 请求时: t2_mcu_tick
-MCU 发送 sync 回复前: t3_mcu_tick
-NV  收到 sync 回复后: t4_nv_ns
-```
+### 2. 最终对外对齐时间轴
 
-推荐要求：
+最终对外对齐时间轴是 NV/SOC `wall_us` 轴，也就是视频 CSV 里的 `wall_us` 所在时间轴。
 
-- NV 侧同步内部使用 `CLOCK_MONOTONIC_RAW` 或等价单调时钟，不使用 wall clock。
-- MCU 侧使用单调递增硬件 timer，不使用会被校时或重置影响的软时间。
-- MCU 收包后尽快记录 `t2_mcu_tick`。
-- MCU 发回包前尽量贴近串口写入动作记录 `t3_mcu_tick`。
-- NV 收到完整回复包后立即记录 `t4_nv_ns`。
-
-实现落地时建议进一步约束：
-
-- `t1_nv_ns` 在 NV 侧持有串口发送锁并即将写入 sync 请求 frame 前记录。
-- `t4_nv_ns` 在 RX 线程完成 sync 回复包 checksum 校验后立即记录，不能等到业务线程从 queue 中取出响应后再记录。
-- `t2_mcu_tick` 初版可在 MCU 确认收到完整 sync 请求并校验通过后立即记录；如果 UART 驱动能提供首字节或 DMA 接收完成中断时间，则优先使用更靠近实际到达的时间。
-- `t3_mcu_tick` 在 MCU 即将提交 sync 回复 frame 到 UART 写接口前记录；如果 UART 写接口只是入队，也应记录入队前时间，并在日志中保留实现语义。
-- 同步命令需要带 `seq` 并和普通控制命令区分，避免 IMU push frame 与 sync response 在 NV 侧响应队列中混淆。
-
-同步包返回内容至少包含：
+当前 IMU JSON 里的 `timestamp_us` 已经被换算到这条轴上，`sync_quality.time_axis` 也会写：
 
 ```json
-{
-  "type": "time_sync_resp",
-  "seq": 123,
-  "t2_mcu_tick": 1000000,
-  "t3_mcu_tick": 1000200
-}
+"time_axis": "nv_wall_us"
 ```
 
-NV 本地为同一个 `seq` 保存：
+### 3. 当前映射关系
 
-```json
-{
-  "seq": 123,
-  "t1_nv_ns": 987654321000,
-  "t4_nv_ns": 987655421000
-}
-```
-
-## Offset 估计
-
-若 MCU tick 已可换算为 MCU 微秒时间，则一次同步的近似计算为：
+当前映射关系是：
 
 ```text
-mcu_mid_us = (mcu_us(t2_mcu_tick) + mcu_us(t3_mcu_tick)) / 2
-nv_mid_us  = (t1_nv_ns / 1000 + t4_nv_ns / 1000) / 2
-offset_us  = nv_mid_us - mcu_mid_us
+mcu_to_mono_offset_us = selected_sync.offset_us
 
-rtt_us = (t4_nv_ns - t1_nv_ns) / 1000 - (mcu_us(t3_mcu_tick) - mcu_us(t2_mcu_tick))
+imu_mono_us = mcu_tick_us + mcu_to_mono_offset_us
+
+mono_to_wall_us = anchor_wall_us - anchor_monotonic_ns / 1000
+
+timestamp_us = imu_mono_us + mono_to_wall_us
 ```
 
-其中：
+当前代码层面的等价实现是：
 
-- `offset_us` 表示本轮估计出的 MCU 到 NV 时间轴偏移。
-- `rtt_us` 表示扣除 MCU 内部处理耗时后的往返链路耗时。
+- `mcu_to_mono_offset_us = mapping.sample.offset_us`
+- `imu_mono_us = mcu_tick_us + mapping.sample.offset_us`
+- 如果没有显式 anchor，则临时使用当前接收帧的  
+  `mono_to_wall_us = rx_wall_us - rx_monotonic_ns / 1000`
+- `timestamp_us = imu_mono_us + mono_to_wall_us`
 
-实际使用时，不建议简单平均所有同步包。推荐每次校准发送多次 sync，例如 10 到 30 次，然后选择 RTT 最小的若干样本估计 offset。
+所以结论是：现在落盘的 IMU `timestamp_us` 用的是 NV/SOC `wall_us` 时间轴，应该直接和视频 `*_timestamps.csv` 里的 `wall_us` 对齐。
 
-原因是：
+## 当前落盘字段口径
 
-- RTT 越小，通常说明本轮串口排队、Linux 调度和 MCU 内部阻塞越少。
-- 高 RTT 样本更可能包含偶发排队或调度抖动。
-- 使用低 RTT 样本可以降低同步误差。
+当前 IMU JSON 里，和时间相关的字段应按下面理解。
 
-需要注意，四时间戳公式隐含“上下行链路延迟近似对称”的假设。UART 请求包和回复包长度可能不同，持续 IMU push 也可能插队造成固定偏差或偶发偏差。建议：
+### 正式对齐字段
 
-- 记录 sync 请求和回复 frame 的字节数、波特率和理论线传时间。
-- 同步轮期间尽量降低或短暂停止 IMU push，至少避免大 payload 连续占用串口。
-- 如果不能暂停 IMU push，离线分析时把 sync RTT、当时 IMU push 频率和串口利用率一起记录。
-- 对固定线传长度差造成的偏差，可以按 `byte_count * 10 / baudrate` 粗略估算并纳入误差预算。
-
-## 时间映射策略
-
-### 初版策略
-
-初版实现可以采用：
+正式对齐只用：
 
 ```text
-nv_time_us = mcu_tick / ticks_per_us + offset_us
+imu.imus[].timestamp_us  <->  video_csv.wall_us
 ```
 
-其中 `ticks_per_us` 来自 MCU timer 标称频率。
+### 诊断字段
 
-每隔一段时间重新同步一次，例如：
+不要用这些字段做正式对齐：
 
-- 采集开始前连续同步 10 到 30 次，建立初始 offset。
-- 采集过程中每 5 到 30 秒同步一轮。
-- 每轮选择 RTT 最小的若干样本更新 offset。
+- `rx_timestamp_us`
+- `rx_delay_us`
+- `ts_iso`
+- `mcu_tick_us`
+- `pts_ns`
 
-更新 offset 时不建议突然大跳，除非确认当前映射明显失效。可以记录新旧 offset 差值，用于诊断时钟漂移和同步质量。
+它们的用途分别是：
 
-### 长时间漂移修正
+- `rx_timestamp_us`：NV 收到并解析完整 IMU frame 的 wall_us 时间
+- `rx_delay_us`：接收延迟/调度延迟诊断
+- `ts_iso`：可读字符串时间
+- `mcu_tick_us`：MCU 原始时间
+- `pts_ns`：视频内部 PTS
 
-如果 30 到 60 分钟长采集发现 offset 持续单向漂移，说明 MCU timer 与 NV 时钟存在频率差。
+### 当前推荐解释
 
-此时应从“只估 offset”升级为拟合线性映射：
+- `timestamp_us`：最终用于和视频 `wall_us` 对齐的唯一正式时间戳
+- `mcu_tick_us`：STM32 本地单调微秒时间，用于同步映射，不直接拿来和视频对齐
+- `sync_quality.offset_us`：本次使用的 MCU->NV monotonic 偏移
+- `sync_quality.mono_to_wall_us`：NV monotonic 到 NV wall 的桥接偏移
+- `sync_quality.rtt_us`：最近一次被选中 sync 样本的 RTT
+- `sync_quality.sync_seq`：最近一次被选中 sync 样本序号
+- `sync_quality.mapping_version`：映射版本号
+
+## 当前方案的限制
+
+### 1. WIT 不是传感器内部硬同步
+
+当前只能保证：
+
+- MCU 侧采集节拍稳定
+- 多 IMU 各自有独立 MCU 时间戳
+
+不能保证：
+
+- WIT 内部 ADC/滤波/输出相位被外部同步脉冲真正锁定
+
+### 2. 多 IMU 仍然是顺序读
+
+因此：
+
+- 6 路 IMU 的 `mcu_tick_us` 不会完全相同
+- 分析时应按每个 IMU 自己的 `timestamp_us` 使用
+
+### 3. 当前未做长时间线性拟合
+
+当前只做 offset 映射，没有拟合：
 
 ```text
-nv_time_us = a * mcu_tick + b
+nv_time_us = a * mcu_tick_us + b
 ```
 
-做法：
+如果后续长时间采集发现 STM32 与 NV 存在明显时钟漂移，再考虑引入 `a/b` 拟合。
 
-- 保存多轮低 RTT 同步样本。
-- 使用样本中的 `mcu_mid_tick` 和 `nv_mid_us` 拟合 `a`、`b`。
-- 对异常高 RTT 样本做过滤，不参与拟合。
-- 拟合结果用于后续 IMU 样本时间戳换算。
+## 文档整理说明
 
-### Tick 位宽和回绕
-
-协议层优先使用 64 位 `mcu_tick_us` 或 64 位原始 tick。这样可以降低回绕处理复杂度。
-
-如果 MCU 固件只能发送 32 位 tick，NV 侧必须做 unwrap：
-
-- 协议中明确 `mcu_tick` 的单位、频率和是否从上电开始计数。
-- NV 对每个数据源维护上一帧 tick，检测 32 位回绕并扩展为本地 64 位 tick。
-- 32 位微秒 tick 约 71.6 分钟回绕，已经接近 30 到 60 分钟长时测试范围，不能忽略。
-- 如果发送的是硬件 timer 原始 tick，还需要记录 `ticks_per_us` 或 timer clock Hz。
-
-## IMU 数据格式建议
-
-后续 IMU JSON 行建议保留现有字段，并新增时间相关字段。
-
-建议字段：
-
-```json
-{
-  "timestamp_us": 1760000000123456,
-  "rx_timestamp_us": 1760000000126789,
-  "mcu_tick": 1234567890,
-  "mcu_tick_by_addr": {
-    "0x50": 1234567890,
-    "0x51": 1234568010
-  },
-  "sync_quality": {
-    "offset_us": 1234,
-    "rtt_us": 2200,
-    "sync_seq": 100,
-    "mapping_version": 3
-  },
-  "poses_by_addr": {},
-  "acc_by_addr": {},
-  "gyro_by_addr": {},
-  "quaternion_by_addr": {},
-  "sample_timestamp_by_addr": {}
-}
-```
-
-字段语义：
-
-- `timestamp_us`：根据 `mcu_tick -> nv_time_us` 映射换算出的 SOC 时间戳，后续对齐视频优先使用它。
-- `rx_timestamp_us`：NV 实际收到并解析 IMU 包的时间，用于诊断串口延迟。
-- `mcu_tick`：MCU 给该 IMU 样本打的本地时间戳。
-- `mcu_tick_by_addr`：当一包中包含多个 IMU 样本时，记录每个地址各自的 MCU 本地时间戳。多 IMU 顺序读取时不建议只保留一个顶层 `mcu_tick`。
-- `sync_quality.offset_us`：生成该 `timestamp_us` 时使用的 offset 或当前映射偏移。
-- `sync_quality.rtt_us`：最近一次参与映射更新的同步 RTT。
-- `sync_quality.sync_seq`：最近一次参与映射更新的同步序号。
-- `sync_quality.mapping_version`：NV 本地映射版本号，便于离线分析不同时间段的映射变化。
-
-字段和当前工程语义建议如下：
-
-- `ts_iso`：只作为兼容展示或 NV 接收时间的字符串表达，不参与 IMU/视频严肃对齐。
-- `rx_timestamp_us`：NV 解析到完整 IMU frame 后立即记录的接收时间，建议和最终输出时间轴一致。
-- `mcu_tick` / `mcu_tick_by_addr`：STM32 本地单调时间，来自 MCU 对 IMU 数据打点，不应由 NV 侧生成。
-- `sample_timestamp_by_addr`：保留 IMU 模组内部样本时间戳或诊断时间戳；除非确认其频率、零点、回绕和采样语义，否则不要直接等同于 `mcu_tick`。
-- `timestamp_us`：由 NV 根据当前 `mcu_tick -> SOC time` 映射换算出的最终对齐时间戳。
-
-关键要求：
-
-- MCU 应在尽量靠近真实采样的位置打 `mcu_tick`。
-- 如果 MCU 是收到 IMU 数据 ready 中断后读取数据，应在中断或读取完成附近记录 `mcu_tick`。
-- 不建议在 MCU 准备把数据发给 NV 时才打 `mcu_tick`，否则时间戳会包含 MCU 内部排队延迟。
-- 如果一包中聚合多个 IMU，MCU 应优先为每个 IMU record 单独携带 `mcu_tick`。只有能证明这些样本严格同一采样时刻时，才使用顶层公共 `mcu_tick`。
-
-## 视频与 IMU 对齐策略
-
-视频侧已有两类可用时间戳：
-
-- `*_timestamps.csv` 中的 `wall_us`。
-- MP4 H.264 SEI 中的帧时间戳。
-
-对齐时建议：
-
-1. 先确认 IMU `timestamp_us` 与视频 `wall_us` / SEI 使用同一 SOC 时间轴。
-2. 以视频第一帧 `wall_us` 作为本次 session 的时间零点。
-3. 对每条 IMU 样本使用 `timestamp_us` 计算相对时间。
-4. 需要诊断延迟时，再查看 `rx_timestamp_us - timestamp_us`。
-
-示例：
-
-```text
-video_t0_us = first_video_wall_us
-video_frame_rel_ms = (frame_wall_us - video_t0_us) / 1000
-imu_rel_ms = (imu.timestamp_us - video_t0_us) / 1000
-imu_rx_delay_ms = (imu.rx_timestamp_us - imu.timestamp_us) / 1000
-```
-
-如果 `imu_rx_delay_ms` 基本稳定，说明串口链路和系统调度比较平稳。如果该值出现明显尖峰，应优先怀疑串口 buffer 堆积、MCU 发送排队或 NV 用户态调度延迟。
-
-## 测试方案
-
-### 1. 离线同步日志检查
-
-目标：
-
-- 确认四时间戳同步包能稳定往返。
-- 统计 RTT、offset 和低 RTT 样本稳定性。
-
-检查项：
-
-- `seq` 是否连续。
-- RTT 是否存在明显尖峰。
-- 低 RTT 样本的 offset 是否稳定。
-- offset 是否随时间单向漂移。
-
-建议输出：
-
-```text
-sync_count
-rtt_min_us
-rtt_p50_us
-rtt_p95_us
-rtt_max_us
-offset_min_us
-offset_p50_us
-offset_p95_us
-offset_max_us
-offset_drift_us_per_min
-```
-
-### 2. 短时采集测试
-
-采集 1 到 3 分钟，检查：
-
-- IMU `timestamp_us` 是否单调递增。
-- IMU 采样间隔是否符合预期频率。
-- `rx_timestamp_us - timestamp_us` 的分布是否稳定。
-- 视频第一帧与 IMU 时间范围是否有合理交集。
-
-通过口径：
-
-- 无明显时间戳倒退。
-- 无大段 IMU 时间戳空洞。
-- `rx_timestamp_us - timestamp_us` 没有频繁大尖峰。
-
-### 3. 长时漂移测试
-
-采集 30 到 60 分钟，检查：
-
-- 周期同步得到的 offset 是否持续单边漂移。
-- 只估 `b` 是否足够。
-- 是否需要启用 `a/b` 线性拟合。
-
-通过口径：
-
-- 若 offset 漂移在业务可接受范围内，初版固定 `a` 可继续使用。
-- 若 offset 随时间稳定增长或减小，应升级为线性拟合。
-
-### 4. 事件级验证
-
-做 5 到 10 次明显事件，例如：
-
-- 快速晃动 IMU。
-- 轻敲 IMU 固定结构。
-- 让相机能看到同一动作。
-
-分析：
-
-- 在 IMU 中找 gyro/acc 峰值时间 `timestamp_us`。
-- 在视频中找动作首次出现或峰值帧时间 `wall_us`。
-- 计算多次事件的 `video_event_us - imu_event_us`。
-
-判断：
-
-- 如果差值稳定，说明可用固定事件 offset 做业务解释。
-- 如果差值抖动很大，应检查同步 RTT、IMU 打点位置和串口排队。
-
-### 5. 硬件 marker 验证
-
-如果需要证明严格同步，建议增加硬件 marker：
-
-- MCU 控制 LED 闪烁，让 LED 入画。
-- MCU 同时在 IMU 数据流中插入 marker。
-- 视频侧检测 LED 首亮帧。
-- IMU 侧读取 marker 的 `mcu_tick` / `timestamp_us`。
-
-这种方式可以绕开“人体动作识别不准”和“峰值定义不一致”的问题，更适合做最终验收。
-
-## 风险和注意事项
-
-- 串口延迟不是绝对固定，只能通过低 RTT 筛选和周期校准降低影响。
-- NV 用户态调度会造成偶发收包延迟，因此 `rx_timestamp_us` 不应作为最终采样时间戳。
-- MCU 必须保证 `mcu_tick` 单调，并处理计数器回绕。
-- 如果 MCU tick 频率不准，长时间采集一定会出现漂移，需要线性拟合修正。
-- 如果 IMU 数据在 MCU 内部已经排队很久才被打时间戳，时间同步本身无法修复这个误差。
-
-## 当前结论
-
-该方案可行，并且比单纯用 NV 收包时间给 IMU 数据打时间戳更可靠。
-
-建议实施顺序：
-
-1. MCU 每条 IMU 样本携带本地 `mcu_tick`。
-2. NV 增加四时间戳同步协议和同步日志。
-3. NV 初版固定 `a`，用低 RTT 样本估计 `b`。
-4. IMU JSON 增加 `timestamp_us`、`rx_timestamp_us`、`mcu_tick` 和同步质量字段。
-5. 通过短时、长时、事件级和硬件 marker 测试验证对齐质量。
+旧文档 [IMU同步执行计划.md](./IMU同步执行计划.md) 中的计划性内容已经并入本文档。后续以本文档为准。

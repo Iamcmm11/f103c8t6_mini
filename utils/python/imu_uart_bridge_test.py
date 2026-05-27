@@ -3,22 +3,24 @@
 Host-side tool for the STM32 UART bridge.
 
 Run from repo root with utils/python path:
-  python utils/python/imu_uart_bridge_test.py --port COM13 ping
-  python utils/python/imu_uart_bridge_test.py --port COM13 rgb 135 206 250
+  python utils/python/imu_uart_bridge_test.py --port COM13 ping  python utils/python/imu_uart_bridge_test.py --port COM13 rgb 135 206 250
   python utils/python/imu_uart_bridge_test.py --port COM13 led 3 255 0 0
   python utils/python/imu_uart_bridge_test.py --port COM13 off
   python utils/python/imu_uart_bridge_test.py --port COM13 blink 135 206 250 --delay-ms 300
   python utils/python/imu_uart_bridge_test.py --port COM13 led-blink 3 255 0 0 --delay-ms 300
   python utils/python/imu_uart_bridge_test.py --port COM13 console
-
+  python utils/python/imu_uart_bridge_test.py --port COM13 --baud 115200 sync-monitor
 Run from repo root with scripts path:
-  python scripts/imu_uart_bridge_test.py --port /dev/ttyTCU0 ping
-  python scripts/imu_uart_bridge_test.py --port /dev/ttyTCU0 rgb 135 206 250
-  python scripts/imu_uart_bridge_test.py --port /dev/ttyTCU0 led 3 255 0 0
-  python scripts/imu_uart_bridge_test.py --port /dev/ttyTCU0 off
-  python scripts/imu_uart_bridge_test.py --port /dev/ttyTCU0 blink 135 206 250 --delay-ms 300
-  python scripts/imu_uart_bridge_test.py --port /dev/ttyTCU0 led-blink 3 255 0 0 --delay-ms 300
-  python scripts/imu_uart_bridge_test.py --port /dev/ttyTCU0 console
+  python scripts/imu_uart_bridge_test.py --port /dev/ttyTHS1 ping
+  python scripts/imu_uart_bridge_test.py --port /dev/ttyTHS1 rgb 135 206 250
+  python scripts/imu_uart_bridge_test.py --port /dev/ttyTHS1 led 3 254 0 0
+  python scripts/imu_uart_bridge_test.py --port /dev/ttyTHS1 
+  
+  python scripts/imu_uart_bridge_test.py --port /dev/ttyTHS1 blink 135 206 250 --delay-ms 300
+  python scripts/imu_uart_bridge_test.py --port /dev/ttyTHS1 led-blink 3 255 0 0 --delay-ms 300
+  python scripts/imu_uart_bridge_test.py --port /dev/ttyTHS1 console
+  
+  python utils/python/imu_uart_bridge_test.py --port /dev/ttyTHS1 --baud 115200 sync-monitor
 
 Short soft-sync capture test:
   mkdir -p sessions/imu_softsync_test log
@@ -83,6 +85,8 @@ IMU_PUSH_POSE_RECORD_SIZE = struct.calcsize(
 IMU_PUSH_WIT_POSE_RECORD_SIZE = struct.calcsize(
     "<B" + ("f" * IMU_PUSH_POSE_FLOAT_COUNT) + "Q"
 )
+IMU_PUSH_WIT_COMPACT_HEADER_SIZE = struct.calcsize("<BQ")
+IMU_PUSH_WIT_COMPACT_RECORD_SIZE = struct.calcsize("<B H hhh hhhh")
 IMU_PUSH_YIS_POSE_RECORD_SIZE = struct.calcsize(
     "<B" + ("f" * IMU_PUSH_POSE_FLOAT_COUNT) + "I"
 )
@@ -90,13 +94,15 @@ IMU_PUSH_EXTENDED_FLOAT_COUNT = 13
 IMU_PUSH_EXTENDED_RECORD_SIZE = struct.calcsize(
     "<B" + ("f" * IMU_PUSH_EXTENDED_FLOAT_COUNT)
 )
-DEFAULT_IMU_ADDR_COLUMNS = [0x50, 0x51, 0x52, 0x53]
+DEFAULT_IMU_ADDR_COLUMNS = [0x50, 0x51, 0x52, 0x53, 0x54, 0x55]
 ANSI_RESET = "\033[0m"
 ANSI_ADDR_COLOR = {
     0x50: "\033[91m",  # red
     0x51: "\033[94m",  # blue
     0x52: "\033[92m",  # green
     0x53: "\033[93m",  # yellow
+    0x54: "\033[95m",  # magenta
+    0x55: "\033[96m",  # cyan
 }
 
 
@@ -967,21 +973,28 @@ class BridgeClient:
             self._last_imu_print_s = now
             parts = ["imu_bundle", str(len(imu_records))]
             for record in imu_records:
+                rpy_values = (record.roll_deg, record.pitch_deg, record.yaw_deg)
+                has_rpy = not any(math.isnan(value) for value in rpy_values)
                 parts.extend(
                     [
                         format_addr_with_color(record.imu_addr),
-                        f"rpy=({record.roll_deg:.3f},{record.pitch_deg:.3f},{record.yaw_deg:.3f})",
                     ]
                 )
+                if has_rpy:
+                    parts.append(
+                        f"rpy=({record.roll_deg:.3f},{record.pitch_deg:.3f},{record.yaw_deg:.3f})"
+                    )
                 if record.sample_timestamp is not None:
                     parts.append(f"sample_ts={record.sample_timestamp}")
                 if record.has_motion_data():
-                    parts.extend(
-                        [
-                            f"acc=({record.acc_x:.3f},{record.acc_y:.3f},{record.acc_z:.3f})",
-                            f"gyro=({record.gyro_x:.3f},{record.gyro_y:.3f},{record.gyro_z:.3f})",
-                        ]
+                    parts.append(
+                        f"acc=({record.acc_x:.3f},{record.acc_y:.3f},{record.acc_z:.3f})"
                     )
+                    gyro_values = (record.gyro_x, record.gyro_y, record.gyro_z)
+                    if not any(math.isnan(value) for value in gyro_values):
+                        parts.append(
+                            f"gyro=({record.gyro_x:.3f},{record.gyro_y:.3f},{record.gyro_z:.3f})"
+                        )
                 if record.has_quaternion():
                     parts.append(
                         f"quat=({record.quat_w:.4f},{record.quat_x:.4f},{record.quat_y:.4f},{record.quat_z:.4f})"
@@ -1015,6 +1028,24 @@ class BridgeClient:
             return None
 
         imu_count = payload[0]
+        if (
+            len(payload)
+            == IMU_PUSH_WIT_COMPACT_HEADER_SIZE
+            + imu_count * IMU_PUSH_WIT_COMPACT_RECORD_SIZE
+        ):
+            _count, base_tick_us = struct.unpack_from("<BQ", payload, 0)
+            imu_records: list[IMUPushRecord] = []
+            offset = IMU_PUSH_WIT_COMPACT_HEADER_SIZE
+            for _ in range(imu_count):
+                imu_records.append(
+                    self._unpack_wit_compact_record(
+                        payload[offset : offset + IMU_PUSH_WIT_COMPACT_RECORD_SIZE],
+                        base_tick_us,
+                    )
+                )
+                offset += IMU_PUSH_WIT_COMPACT_RECORD_SIZE
+            return imu_records
+
         records_raw = payload[1:]
         if imu_count == 0:
             return []
@@ -1037,6 +1068,38 @@ class BridgeClient:
                 self._unpack_imu_record(records_raw[offset : offset + record_size])
             )
         return imu_records
+
+    def _unpack_wit_compact_record(
+        self, payload: bytes, base_tick_us: int
+    ) -> IMUPushRecord:
+        if len(payload) != IMU_PUSH_WIT_COMPACT_RECORD_SIZE:
+            raise ValueError(f"unsupported compact imu record size: {len(payload)}")
+        (
+            imu_addr,
+            tick_delta_us,
+            acc_x_mg,
+            acc_y_mg,
+            acc_z_mg,
+            quat_w_q15,
+            quat_x_q15,
+            quat_y_q15,
+            quat_z_q15,
+        ) = struct.unpack("<B H hhh hhhh", payload)
+        gravity_mps2 = 9.80665
+        return IMUPushRecord(
+            imu_addr=imu_addr,
+            roll_deg=math.nan,
+            pitch_deg=math.nan,
+            yaw_deg=math.nan,
+            mcu_tick_us=base_tick_us + tick_delta_us,
+            acc_x=acc_x_mg * gravity_mps2 / 1000.0,
+            acc_y=acc_y_mg * gravity_mps2 / 1000.0,
+            acc_z=acc_z_mg * gravity_mps2 / 1000.0,
+            quat_w=quat_w_q15 / 32767.0,
+            quat_x=quat_x_q15 / 32767.0,
+            quat_y=quat_y_q15 / 32767.0,
+            quat_z=quat_z_q15 / 32767.0,
+        )
 
     def _unpack_imu_record(self, payload: bytes) -> IMUPushRecord:
         if len(payload) == IMU_PUSH_LEGACY_RECORD_SIZE:
@@ -1185,7 +1248,10 @@ def send_light_control(
         time.sleep(0.02)
         resp = client.request(CMD_WS2812_CONTROL, payload, timeout=1.5)
     if len(resp) != 1:
-        raise RuntimeError(f"unexpected light-control response length: {len(resp)}")
+        raise RuntimeError(
+            f"unexpected light-control response length: {len(resp)}, "
+            f"payload={resp.hex(' ')}"
+        )
     return resp[0]
 
 
@@ -1559,7 +1625,7 @@ def cmd_capture(client: BridgeClient, args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="UART bridge tool for IMU push and WS2812 control")
     parser.add_argument("--port", required=True, help="serial port, e.g. COM12 or /dev/ttyUSB0")
-    parser.add_argument("--baud", type=int, default=115200, help="serial baudrate")
+    parser.add_argument("--baud", type=int, default=460800, help="serial baudrate")
     parser.add_argument("--timeout", type=float, default=0.1, help="serial timeout in seconds")
     parser.add_argument(
         "--imu-print-hz",

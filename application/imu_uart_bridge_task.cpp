@@ -1,6 +1,8 @@
 #include "imu_uart_bridge_task.hpp"
 
+#include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <limits>
@@ -21,15 +23,21 @@ constexpr uint8_t kBridgeCmdSPIWrite = 0x20;
 constexpr uint8_t kBridgeCmdWS2812Control = 0x21;
 constexpr uint8_t kBridgeCmdPosePush = 0x30;
 
-constexpr std::array<uint8_t, 4> kBridgeIMUPushIndexes = {
+constexpr std::array<uint8_t, Manager::ACTUAL_IMU_COUNT> kBridgeIMUPushIndexes = {
     static_cast<uint8_t>(Manager::ImuSlot::Forearm),
     static_cast<uint8_t>(Manager::ImuSlot::Hand),
     static_cast<uint8_t>(Manager::ImuSlot::ThumbRoot),
     static_cast<uint8_t>(Manager::ImuSlot::ThumbTip),
+    static_cast<uint8_t>(Manager::ImuSlot::Extra0),
+    static_cast<uint8_t>(Manager::ImuSlot::Extra1),
 };
 
 constexpr uint8_t kBridgePoseFloatCount = 7;
 constexpr uint8_t kBridgeWITTimestampSize = sizeof(uint64_t);
+constexpr uint8_t kBridgeWITCompactHeaderSize = sizeof(uint8_t) + sizeof(uint64_t);
+constexpr uint8_t kBridgeWITCompactRecordSize =
+    static_cast<uint8_t>(sizeof(uint8_t) + sizeof(uint16_t) +
+                         (3U + 4U) * sizeof(int16_t));
 constexpr uint8_t kBridgeTimeSyncSeqSize = sizeof(uint32_t);
 constexpr uint8_t kBridgeTimeSyncRespPayloadSize = static_cast<uint8_t>(
     1 + kBridgeTimeSyncSeqSize + sizeof(uint64_t) + sizeof(uint64_t));
@@ -44,16 +52,20 @@ constexpr uint8_t kBridgeStatusOk = 0;
 constexpr uint8_t kBridgeStatusError = 1;
 constexpr uint8_t kMaxRegisterCount = 32;
 constexpr uint16_t kBridgeWITMaxPayload = static_cast<uint16_t>(
-    1 + kBridgeIMUPushIndexes.size() * kBridgeWITPoseRecordSize);
+    kBridgeWITCompactHeaderSize +
+    kBridgeIMUPushIndexes.size() * kBridgeWITCompactRecordSize);
 constexpr uint16_t kBridgeMaxResponsePayload =
     (kBridgeWITMaxPayload > kBridgeTimeSyncRespPayloadSize)
         ? kBridgeWITMaxPayload
         : kBridgeTimeSyncRespPayloadSize;
 constexpr uint16_t kBridgeChunkSize = 32;
 constexpr uint32_t kBridgePollTimeoutMs = 2;
+constexpr uint32_t kBridgeWriteRetryCount = 3;
+constexpr uint32_t kBridgeWriteRetryDelayMs = 1;
 constexpr uint32_t kTaskCreateOverheadBytes = 384;
 constexpr uint32_t kTaskCreateSafetyBytes = 256;
 constexpr uint8_t kYISBridgeAddress = 0x6A;
+constexpr float kGravityMps2 = 9.80665f;
 
 constexpr uint16_t BuildLeadingWITBridgeMask(uint8_t imu_count) {
   const uint8_t capped_count =
@@ -62,6 +74,30 @@ constexpr uint16_t BuildLeadingWITBridgeMask(uint8_t imu_count) {
   return (capped_count == 0U)
              ? 0U
              : static_cast<uint16_t>((1u << capped_count) - 1u);
+}
+
+int16_t FloatToInt16Clamped(float value) {
+  if (std::isnan(value)) {
+    return 0;
+  }
+  const float rounded = std::round(value);
+  const float clamped =
+      std::max(-32768.0f, std::min(32767.0f, rounded));
+  return static_cast<int16_t>(clamped);
+}
+
+int16_t AccMps2ToMilliG(float acc_mps2) {
+  return FloatToInt16Clamped(acc_mps2 / kGravityMps2 * 1000.0f);
+}
+
+int16_t QuatToQ15(float quat) { return FloatToInt16Clamped(quat * 32767.0f); }
+
+uint16_t TickDeltaUs(uint64_t base_tick_us, uint64_t tick_us) {
+  if (tick_us <= base_tick_us) {
+    return 0U;
+  }
+  const uint64_t delta = tick_us - base_tick_us;
+  return (delta > 0xFFFFULL) ? 0xFFFFU : static_cast<uint16_t>(delta);
 }
 
 }  // namespace
@@ -255,11 +291,19 @@ void IMUUartBridgeTask::PublishBridgePoseData() {
     auto& imu_msg = wit_subscriber_->GetData();
     const uint16_t wit_push_slots_mask =
         BuildLeadingWITBridgeMask(config_.wit_push_imu_count);
-    std::array<uint8_t,
-               1 + kBridgeIMUPushIndexes.size() * kBridgeWITPoseRecordSize>
-        payload{};
+    std::array<uint8_t, kBridgeWITMaxPayload> payload{};
     payload[0] = 0;
-    uint16_t payload_len = 1;
+    uint64_t base_tick_us = 0U;
+    for (const uint8_t imu_index : kBridgeIMUPushIndexes) {
+      if ((wit_push_slots_mask & (1u << imu_index)) == 0U ||
+          !imu_msg.IsValid(imu_index)) {
+        continue;
+      }
+      base_tick_us = imu_msg.imu_data[imu_index].mcu_tick_us;
+      break;
+    }
+    std::memcpy(payload.data() + 1, &base_tick_us, sizeof(base_tick_us));
+    uint16_t payload_len = kBridgeWITCompactHeaderSize;
 
     for (const uint8_t imu_index : kBridgeIMUPushIndexes) {
       if ((wit_push_slots_mask & (1u << imu_index)) == 0U) {
@@ -270,40 +314,42 @@ void IMUUartBridgeTask::PublishBridgePoseData() {
         continue;
       }
 
-      std::array<float, kBridgePoseFloatCount> values{};
-      values.fill(std::numeric_limits<float>::quiet_NaN());
-      if (valid) {
-        const auto& imu = imu_msg.imu_data[imu_index];
-        values = {imu.angle[0],      imu.angle[1],      imu.angle[2],
-                  imu.quaternion[0], imu.quaternion[1], imu.quaternion[2],
-                  imu.quaternion[3]};
-      }
-
       const uint16_t base = payload_len;
       payload[base] =
           Manager::ResolveImuI2CAddress(imu_index, config_.imu_addr);
       uint16_t cursor = static_cast<uint16_t>(base + 1);
-      for (const float value : values) {
-        std::memcpy(payload.data() + cursor, &value, sizeof(float));
-        cursor = static_cast<uint16_t>(cursor + sizeof(float));
-      }
+      const auto& imu = imu_msg.imu_data[imu_index];
+      const uint16_t tick_delta_us =
+          valid ? TickDeltaUs(base_tick_us, imu.mcu_tick_us) : 0U;
+      std::memcpy(payload.data() + cursor, &tick_delta_us,
+                  sizeof(tick_delta_us));
+      cursor = static_cast<uint16_t>(cursor + sizeof(tick_delta_us));
+
+      std::array<int16_t, 3> acc_mg = {0, 0, 0};
+      std::array<int16_t, 4> quat_q15 = {0, 0, 0, 0};
       if (valid) {
-        const auto& imu = imu_msg.imu_data[imu_index];
-        std::memcpy(payload.data() + cursor, &imu.mcu_tick_us,
-                    sizeof(imu.mcu_tick_us));
-      } else {
-        const uint64_t zero_tick = 0U;
-        std::memcpy(payload.data() + cursor, &zero_tick, sizeof(zero_tick));
+        acc_mg = {AccMps2ToMilliG(imu.acc[0]), AccMps2ToMilliG(imu.acc[1]),
+                  AccMps2ToMilliG(imu.acc[2])};
+        quat_q15 = {QuatToQ15(imu.quaternion[0]), QuatToQ15(imu.quaternion[1]),
+                    QuatToQ15(imu.quaternion[2]),
+                    QuatToQ15(imu.quaternion[3])};
       }
-      cursor = static_cast<uint16_t>(cursor + kBridgeWITTimestampSize);
+      for (const int16_t value : acc_mg) {
+        std::memcpy(payload.data() + cursor, &value, sizeof(value));
+        cursor = static_cast<uint16_t>(cursor + sizeof(value));
+      }
+      for (const int16_t value : quat_q15) {
+        std::memcpy(payload.data() + cursor, &value, sizeof(value));
+        cursor = static_cast<uint16_t>(cursor + sizeof(value));
+      }
 
       ++payload[0];
       payload_len =
-          static_cast<uint16_t>(payload_len + kBridgeWITPoseRecordSize);
+          static_cast<uint16_t>(payload_len + kBridgeWITCompactRecordSize);
     }
 
-    if (payload[0] > 0) {
-      SendResponse(kBridgeCmdPosePush, payload.data(), payload_len);
+    if (payload[0] > 0 &&
+        SendResponse(kBridgeCmdPosePush, payload.data(), payload_len)) {
       last_pose_push_ms_ = now_ms;
     }
     wit_subscriber_->StartWaiting();
@@ -333,8 +379,9 @@ void IMUUartBridgeTask::PublishBridgePoseData() {
                 sizeof(yis_msg.sample_timestamp));
     cursor = static_cast<uint16_t>(cursor + sizeof(yis_msg.sample_timestamp));
 
-    SendResponse(kBridgeCmdPosePush, payload.data(), cursor);
-    last_pose_push_ms_ = now_ms;
+    if (SendResponse(kBridgeCmdPosePush, payload.data(), cursor)) {
+      last_pose_push_ms_ = now_ms;
+    }
   }
   yis_subscriber_->StartWaiting();
 }
@@ -413,9 +460,17 @@ bool IMUUartBridgeTask::WriteExact(const uint8_t* buf, uint16_t len) {
     return true;
   }
 
-  Semaphore sem(0);
-  WriteOperation op(sem);
-  return uart_->Write({buf, len}, op) == ErrorCode::OK;
+  for (uint32_t attempt = 0; attempt < kBridgeWriteRetryCount; ++attempt) {
+    Semaphore sem(0);
+    WriteOperation op(sem);
+    if (uart_->Write({buf, len}, op) == ErrorCode::OK) {
+      return true;
+    }
+    if ((attempt + 1U) < kBridgeWriteRetryCount) {
+      Thread::Sleep(kBridgeWriteRetryDelayMs);
+    }
+  }
+  return false;
 }
 
 bool IMUUartBridgeTask::WriteSPI(const uint8_t* buf, uint16_t len) {
@@ -431,10 +486,10 @@ bool IMUUartBridgeTask::WriteSPI(const uint8_t* buf, uint16_t len) {
   return spi_->Write({buf, len}, op) == ErrorCode::OK;
 }
 
-void IMUUartBridgeTask::SendResponse(uint8_t cmd, const uint8_t* payload,
+bool IMUUartBridgeTask::SendResponse(uint8_t cmd, const uint8_t* payload,
                                      uint16_t len) {
   if (len > kBridgeMaxResponsePayload) {
-    return;
+    return false;
   }
 
   std::array<uint8_t, 5 + kBridgeMaxResponsePayload + 1> frame{};
@@ -449,7 +504,7 @@ void IMUUartBridgeTask::SendResponse(uint8_t cmd, const uint8_t* payload,
   frame[5 + len] = static_cast<uint8_t>(
       CalcSum(frame.data(), static_cast<uint16_t>(5 + len)));
 
-  (void)WriteExact(frame.data(), static_cast<uint16_t>(6 + len));
+  return WriteExact(frame.data(), static_cast<uint16_t>(6 + len));
 }
 
 void IMUUartBridgeTask::HandleCommand(uint8_t cmd, uint16_t payload_len) {
@@ -483,7 +538,7 @@ void IMUUartBridgeTask::HandleCommand(uint8_t cmd, uint16_t payload_len) {
         return;
       }
       uint8_t resp = kBridgeStatusError;
-      SendResponse(cmd, &resp, 1);
+      (void)SendResponse(cmd, &resp, 1);
       return;
     }
   }
@@ -496,14 +551,14 @@ void IMUUartBridgeTask::HandlePing(uint8_t cmd, uint16_t payload_len,
       return;
     }
     uint8_t resp = kBridgeStatusError;
-    SendResponse(cmd, &resp, 1);
+    (void)SendResponse(cmd, &resp, 1);
     return;
   }
   if (!ReadChecksum(sum)) {
     return;
   }
   const uint8_t ok = kBridgeStatusOk;
-  SendResponse(cmd, &ok, 1);
+  (void)SendResponse(cmd, &ok, 1);
 }
 
 void IMUUartBridgeTask::HandleTimeSync(uint8_t cmd, uint16_t payload_len,
@@ -514,7 +569,7 @@ void IMUUartBridgeTask::HandleTimeSync(uint8_t cmd, uint16_t payload_len,
       return;
     }
     uint8_t resp = kBridgeStatusError;
-    SendResponse(cmd, &resp, 1);
+    (void)SendResponse(cmd, &resp, 1);
     return;
   }
   if (!ReadChunked(payload, sizeof(payload), sum) || !ReadChecksum(sum)) {
@@ -535,7 +590,7 @@ void IMUUartBridgeTask::HandleTimeSync(uint8_t cmd, uint16_t payload_len,
   cursor = static_cast<uint16_t>(cursor + sizeof(t2_mcu_tick_us));
   std::memcpy(resp.data() + cursor, &t3_mcu_tick_us, sizeof(t3_mcu_tick_us));
   cursor = static_cast<uint16_t>(cursor + sizeof(t3_mcu_tick_us));
-  SendResponse(cmd, resp.data(), cursor);
+  (void)SendResponse(cmd, resp.data(), cursor);
 }
 
 void IMUUartBridgeTask::HandleI2CRead(uint8_t cmd, uint16_t payload_len,
@@ -546,7 +601,7 @@ void IMUUartBridgeTask::HandleI2CRead(uint8_t cmd, uint16_t payload_len,
       return;
     }
     uint8_t resp = kBridgeStatusError;
-    SendResponse(cmd, &resp, 1);
+    (void)SendResponse(cmd, &resp, 1);
     return;
   }
   if (!ReadChunked(payload, sizeof(payload), sum) || !ReadChecksum(sum)) {
@@ -578,7 +633,7 @@ void IMUUartBridgeTask::HandleI2CRead(uint8_t cmd, uint16_t payload_len,
     }
   }
 
-  SendResponse(cmd, resp.data(), resp_len);
+  (void)SendResponse(cmd, resp.data(), resp_len);
 }
 
 void IMUUartBridgeTask::HandleI2CWrite(uint8_t cmd, uint16_t payload_len,
@@ -589,7 +644,7 @@ void IMUUartBridgeTask::HandleI2CWrite(uint8_t cmd, uint16_t payload_len,
       return;
     }
     uint8_t resp = kBridgeStatusError;
-    SendResponse(cmd, &resp, 1);
+    (void)SendResponse(cmd, &resp, 1);
     return;
   }
   if (!ReadChunked(payload, sizeof(payload), sum) || !ReadChecksum(sum)) {
@@ -616,7 +671,7 @@ void IMUUartBridgeTask::HandleI2CWrite(uint8_t cmd, uint16_t payload_len,
     }
   }
 
-  SendResponse(cmd, &resp, 1);
+  (void)SendResponse(cmd, &resp, 1);
 }
 
 void IMUUartBridgeTask::HandleSPIWrite(uint8_t cmd, uint16_t payload_len,
@@ -628,7 +683,7 @@ void IMUUartBridgeTask::HandleSPIWrite(uint8_t cmd, uint16_t payload_len,
     if (!DiscardChunked(payload_len, sum) || !ReadChecksum(sum)) {
       return;
     }
-    SendResponse(cmd, &resp, 1);
+    (void)SendResponse(cmd, &resp, 1);
     return;
   }
   if (!ReadChunked(meta, sizeof(meta), sum)) {
@@ -658,7 +713,7 @@ void IMUUartBridgeTask::HandleSPIWrite(uint8_t cmd, uint16_t payload_len,
   if (frame_ok && meta[0] == config_.spi_bus && WriteSPI(tx_ptr, spi_len)) {
     resp = kBridgeStatusOk;
   }
-  SendResponse(cmd, &resp, 1);
+  (void)SendResponse(cmd, &resp, 1);
 }
 
 void IMUUartBridgeTask::HandleWS2812Control(uint8_t cmd, uint16_t payload_len,
@@ -670,7 +725,7 @@ void IMUUartBridgeTask::HandleWS2812Control(uint8_t cmd, uint16_t payload_len,
     if (!DiscardChunked(payload_len, sum) || !ReadChecksum(sum)) {
       return;
     }
-    SendResponse(cmd, &resp, 1);
+    (void)SendResponse(cmd, &resp, 1);
     return;
   }
   if (!ReadChunked(payload, sizeof(payload), sum) || !ReadChecksum(sum)) {
@@ -690,7 +745,7 @@ void IMUUartBridgeTask::HandleWS2812Control(uint8_t cmd, uint16_t payload_len,
           ErrorCode::OK) {
     resp = kBridgeStatusOk;
   }
-  SendResponse(cmd, &resp, 1);
+  (void)SendResponse(cmd, &resp, 1);
 }
 
 bool IMUUartBridgeTask::ReadChecksum(uint8_t expected_sum) {

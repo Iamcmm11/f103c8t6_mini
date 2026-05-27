@@ -1,11 +1,31 @@
 GPIO:
+  PA1:
+    Signal: GPXTI1
+    GPXTI: true
+  PA15:
+    Signal: GPIO_Output
   PA4:
     Signal: GPIO_Output
   PA6:
     Signal: GPXTI6
     GPXTI: true
+  PB3:
+    Signal: GPIO_Output
+  PB4:
+    Signal: GPIO_Output
+  PC10:
+    Signal: GPIO_Output
 Peripherals:
   TIM:
+    TIM2:
+      Period: 3332
+      Prescaler: 639
+      Channels:
+        CH3:
+          Label: TIM2
+          PWM: true
+          Complementary: false
+          DutyCycle: null
     TIM5:
       Period: 9999
       Prescaler: 6399
@@ -55,6 +75,7 @@ Peripherals:
     UART5:
       Mode: Asynchronous
     USART1:
+      BaudRate: 460800
       Mode: Asynchronous
       dma:
         dma_rx: &id005

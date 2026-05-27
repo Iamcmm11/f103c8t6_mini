@@ -8,7 +8,7 @@ namespace Manager {
 // 预留的 IMU 最大槽位数，方便后续扩展更多传感器。
 constexpr uint8_t MAX_IMU_COUNT = 16;
 // 当前工程实际启用的 IMU 槽位数，业务层按这个数量组织消息和地址映射。
-constexpr uint8_t ACTUAL_IMU_COUNT = 4;
+constexpr uint8_t ACTUAL_IMU_COUNT = 6;
 
 // 逻辑槽位定义，用固定部位名称把 IMU 与手部位置绑定起来。
 enum class ImuSlot : uint8_t {
@@ -16,30 +16,23 @@ enum class ImuSlot : uint8_t {
   Hand = 1,
   ThumbRoot = 2,
   ThumbTip = 3,
+  Extra0 = 4,
+  Extra1 = 5,
 };
 
-// 默认地址布局：4 个 IMU 依次占用 0x50 ~ 0x53。
+// 默认地址布局：6 个 IMU 依次占用 0x50 ~ 0x55。
 static constexpr uint8_t kForearmImuI2CAddr = 0x50;
 static constexpr uint8_t kHandImuI2CAddr = 0x51;
 static constexpr uint8_t kThumbRootImuI2CAddr = 0x52;
 static constexpr uint8_t kThumbTipImuI2CAddr = 0x53;
+static constexpr uint8_t kExtra0ImuI2CAddr = 0x54;
+static constexpr uint8_t kExtra1ImuI2CAddr = 0x55;
 static constexpr uint8_t kDefaultImuAddress = kForearmImuI2CAddr;
 
 // 根据槽位索引和基地址推导真实 I2C 地址，便于 manager 统一创建传感器对象。
 constexpr uint8_t ResolveImuI2CAddress(
     uint8_t index, uint8_t base_address = kDefaultImuAddress) {
-  switch (index) {
-    case static_cast<uint8_t>(ImuSlot::Forearm):
-      return base_address;
-    case static_cast<uint8_t>(ImuSlot::Hand):
-      return static_cast<uint8_t>(base_address + 1U);
-    case static_cast<uint8_t>(ImuSlot::ThumbRoot):
-      return static_cast<uint8_t>(base_address + 2U);
-    case static_cast<uint8_t>(ImuSlot::ThumbTip):
-      return static_cast<uint8_t>(base_address + 3U);
-    default:
-      return base_address;
-  }
+  return static_cast<uint8_t>(base_address + index);
 }
 
 static_assert(ACTUAL_IMU_COUNT <= MAX_IMU_COUNT,

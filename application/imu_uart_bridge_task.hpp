@@ -57,7 +57,7 @@ class IMUUartBridgeTask {
   bool DiscardChunked(uint16_t len, uint8_t& sum);
   bool WriteExact(const uint8_t* buf, uint16_t len);
   bool WriteSPI(const uint8_t* buf, uint16_t len);
-  void SendResponse(uint8_t cmd, const uint8_t* payload, uint16_t len);
+  bool SendResponse(uint8_t cmd, const uint8_t* payload, uint16_t len);
   void HandleCommand(uint8_t cmd, uint16_t payload_len);
   void HandlePing(uint8_t cmd, uint16_t payload_len, uint8_t sum);
   void HandleI2CRead(uint8_t cmd, uint16_t payload_len, uint8_t sum);
