@@ -1,10 +1,12 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
 
 #include "i2c.hpp"
 #include "libxr_def.hpp"
 #include "managers/imu_manager.hpp"
+#include "managers/sync_signal_manager.hpp"
 #include "message.hpp"
 #include "spi.hpp"
 #include "thread.hpp"
@@ -25,6 +27,7 @@ struct IMUUartBridgeConfig {
   uint32_t read_timeout_ms = 50;
   bool stream_relative_euler = true;
   bool push_imu_euler_in_bridge = true;
+  bool push_sync_events_in_bridge = true;
   bool push_all_slots_in_bridge = true;
   uint8_t wit_push_imu_count = Manager::ACTUAL_IMU_COUNT;
   BridgePoseSource pose_source = BridgePoseSource::WIT;
@@ -46,27 +49,49 @@ class IMUUartBridgeTask {
 
  private:
   static void TaskEntry(IMUUartBridgeTask* arg);
+  enum class CommandParserState : uint8_t {
+    WAIT_SOF0,
+    WAIT_SOF1,
+    READ_CMD,
+    READ_LEN0,
+    READ_LEN1,
+    READ_PAYLOAD,
+    READ_CHECKSUM,
+  };
+  enum class PublishResult : uint8_t {
+    NONE,
+    SENT,
+    BACKPRESSURE,
+  };
+
   void Run();
   void RunStreamMode();
   void RunBridgeMode();
-  void PublishBridgePoseData();
+  bool ProcessPendingCommand();
+  void ProcessCommandByte(uint8_t byte);
+  void ResetCommandParser();
+  PublishResult PublishBridgePoseData();
+  void PublishSyncEvents();
   bool WriteString(const char* str);
-  bool ReadByte(uint8_t& byte, uint32_t timeout_ms);
-  bool ReadExact(uint8_t* buf, uint16_t len, uint32_t timeout_ms);
-  bool ReadChunked(uint8_t* buf, uint16_t len, uint8_t& sum);
-  bool DiscardChunked(uint16_t len, uint8_t& sum);
   bool WriteExact(const uint8_t* buf, uint16_t len);
   bool WriteSPI(const uint8_t* buf, uint16_t len);
   bool SendResponse(uint8_t cmd, const uint8_t* payload, uint16_t len);
-  void HandleCommand(uint8_t cmd, uint16_t payload_len);
-  void HandlePing(uint8_t cmd, uint16_t payload_len, uint8_t sum);
-  void HandleI2CRead(uint8_t cmd, uint16_t payload_len, uint8_t sum);
-  void HandleI2CWrite(uint8_t cmd, uint16_t payload_len, uint8_t sum);
-  void HandleSPIWrite(uint8_t cmd, uint16_t payload_len, uint8_t sum);
-  void HandleWS2812Control(uint8_t cmd, uint16_t payload_len, uint8_t sum);
-  void HandleTimeSync(uint8_t cmd, uint16_t payload_len, uint8_t sum);
-  bool ReadChecksum(uint8_t expected_sum);
+  void HandleCommandFrame(uint8_t cmd, const uint8_t* payload,
+                          uint16_t payload_len);
+  void HandlePing(uint8_t cmd, const uint8_t* payload, uint16_t payload_len);
+  void HandleI2CRead(uint8_t cmd, const uint8_t* payload,
+                     uint16_t payload_len);
+  void HandleI2CWrite(uint8_t cmd, const uint8_t* payload,
+                      uint16_t payload_len);
+  void HandleSPIWrite(uint8_t cmd, const uint8_t* payload,
+                      uint16_t payload_len);
+  void HandleWS2812Control(uint8_t cmd, const uint8_t* payload,
+                           uint16_t payload_len);
+  void HandleTimeSync(uint8_t cmd, const uint8_t* payload,
+                      uint16_t payload_len);
   uint8_t CalcSum(const uint8_t* buf, uint16_t len) const;
+
+  static constexpr uint16_t kCommandPayloadBufferSize = 1024;
 
   LibXR::UART* uart_;
   LibXR::I2C* i2c_;
@@ -78,7 +103,18 @@ class IMUUartBridgeTask {
   uint32_t last_pose_push_ms_;
   LibXR::Thread* thread_;
   LibXR::Topic::ASyncSubscriber<Manager::IMUArrayMsg>* wit_subscriber_;
-  LibXR::Topic::ASyncSubscriber<Manager::YISPoseMsg>* yis_subscriber_;
+  LibXR::LockFreeQueue<Manager::YISPoseMsg>* yis_queue_;
+  LibXR::Topic::QueuedSubscriber* yis_queue_subscriber_;
+  CommandParserState command_parser_state_ = CommandParserState::WAIT_SOF0;
+  std::array<uint8_t, kCommandPayloadBufferSize> command_payload_{};
+  uint16_t command_payload_len_ = 0;
+  uint16_t command_payload_pos_ = 0;
+  uint8_t command_cmd_ = 0;
+  uint8_t command_sum_ = 0;
+  Manager::YISPoseMsg latest_yis_pose_{};
+  bool has_latest_yis_pose_ = false;
+  std::array<Manager::SyncEventRecord, 8> pending_sync_events_{};
+  uint8_t pending_sync_event_count_ = 0;
 };
 
 }  // namespace Application

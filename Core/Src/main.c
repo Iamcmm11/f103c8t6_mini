@@ -57,6 +57,8 @@
 void SystemClock_Config(void);
 void MX_FREERTOS_Init(void);
 /* USER CODE BEGIN PFP */
+void app_on_tim2_period_elapsed(void);
+void app_on_tim5_period_elapsed(void);
 void app_on_tim6_period_elapsed(void);
 
 /* USER CODE END PFP */
@@ -194,6 +196,14 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
     HAL_IncTick();
   }
   /* USER CODE BEGIN Callback 1 */
+  else if (htim->Instance == TIM2)
+  {
+    app_on_tim2_period_elapsed();
+  }
+  else if (htim->Instance == TIM5)
+  {
+    app_on_tim5_period_elapsed();
+  }
   else if (htim->Instance == TIM6)
   {
     app_on_tim6_period_elapsed();

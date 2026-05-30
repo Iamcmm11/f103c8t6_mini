@@ -69,6 +69,7 @@ CMD_TIME_SYNC = 0x02
 CMD_WS2812_CONTROL = 0x21
 CMD_IMU_EULER_PUSH = 0x30
 CMD_IMU_DIAG_PUSH = 0x31
+CMD_SYNC_EVENT_PUSH = 0x32
 
 STATUS_OK = 0
 DEFAULT_LED_COUNT = 21
@@ -90,6 +91,10 @@ IMU_PUSH_WIT_COMPACT_RECORD_SIZE = struct.calcsize("<B H hhh hhhh")
 IMU_PUSH_YIS_POSE_RECORD_SIZE = struct.calcsize(
     "<B" + ("f" * IMU_PUSH_POSE_FLOAT_COUNT) + "I"
 )
+IMU_PUSH_YIS_EXTENDED_POSE_RECORD_SIZE = struct.calcsize(
+    "<B" + ("f" * IMU_PUSH_POSE_FLOAT_COUNT) + "IQQB"
+)
+SYNC_EVENT_RECORD_SIZE = struct.calcsize("<BBHIQII")
 IMU_PUSH_EXTENDED_FLOAT_COUNT = 13
 IMU_PUSH_EXTENDED_RECORD_SIZE = struct.calcsize(
     "<B" + ("f" * IMU_PUSH_EXTENDED_FLOAT_COUNT)
@@ -104,6 +109,10 @@ ANSI_ADDR_COLOR = {
     0x54: "\033[95m",  # magenta
     0x55: "\033[96m",  # cyan
 }
+SYNC_EVENT_SOURCE_NAMES = {
+    1: "TIM5_IMU_SYNC_1HZ",
+    2: "TIM2_CAMERA_TRIGGER_30HZ",
+}
 
 
 @dataclass(frozen=True)
@@ -114,6 +123,9 @@ class IMUPushRecord:
     yaw_deg: float
     mcu_tick_us: Optional[int] = None
     sample_timestamp: Optional[int] = None
+    sensor_mcu_tick_us: Optional[int] = None
+    readout_mcu_tick_us: Optional[int] = None
+    time_status: Optional[int] = None
     acc_x: float = math.nan
     acc_y: float = math.nan
     acc_z: float = math.nan
@@ -130,6 +142,16 @@ class IMUPushRecord:
 
     def has_quaternion(self) -> bool:
         return not math.isnan(self.quat_w)
+
+
+@dataclass(frozen=True)
+class SyncEventRecord:
+    source: int
+    flags: int
+    sequence: int
+    mcu_tick_us: int
+    nominal_period_us: int
+    dropped_count: int
 
 
 @dataclass
@@ -301,17 +323,27 @@ class TimeSyncMapper:
         mcu_tick_us: Optional[int],
         rx_meta: Optional[RXMetadata],
     ) -> tuple[Optional[int], Optional[dict]]:
+        timestamp_mono_us, timestamp_wall_us, quality = self.map_to_times(
+            mcu_tick_us, rx_meta
+        )
+        return timestamp_wall_us, quality
+
+    def map_to_times(
+        self,
+        mcu_tick_us: Optional[int],
+        rx_meta: Optional[RXMetadata],
+    ) -> tuple[Optional[int], Optional[int], Optional[dict]]:
         if mcu_tick_us is None:
-            return None, None
+            return None, None, None
 
         mapping = self.get()
         if mapping is None:
-            return None, None
+            return None, None, None
 
         mono_to_wall_us = mapping.mono_to_wall_us
         if mono_to_wall_us is None:
             if rx_meta is None:
-                return None, None
+                return None, None, None
             mono_to_wall_us = rx_meta.rx_wall_us - (rx_meta.rx_monotonic_ns // 1000)
         timestamp_mono_us = mcu_tick_us + mapping.sample.offset_us
         timestamp_wall_us = timestamp_mono_us + mono_to_wall_us
@@ -325,7 +357,7 @@ class TimeSyncMapper:
             "time_axis": "nv_wall_us",
             "frozen": mapping.frozen,
         }
-        return timestamp_wall_us, quality
+        return timestamp_mono_us, timestamp_wall_us, quality
 
 
 def parse_time_sync_response(payload: bytes) -> tuple[int, int, int]:
@@ -603,14 +635,17 @@ def format_imu_json_row(
     imus: list[dict] = []
 
     for record in imu_records:
-        tick = record.mcu_tick_us
-        if tick is None and record.sample_timestamp is not None:
-            tick = record.sample_timestamp
+        tick = record.sensor_mcu_tick_us
+        if tick is None:
+            tick = record.mcu_tick_us
 
         timestamp_us = None
+        timestamp_mono_us = None
         sync_quality = None
         if sync_mapper is not None:
-            timestamp_us, sync_quality = sync_mapper.map_to_wall_us(tick, rx_meta)
+            timestamp_mono_us, timestamp_us, sync_quality = sync_mapper.map_to_times(
+                tick, rx_meta
+            )
 
         imu = {
             "addr": f"0x{record.imu_addr:02X}",
@@ -619,10 +654,18 @@ def format_imu_json_row(
             imu["timestamp_us"] = timestamp_us
             if rx_meta is not None:
                 imu["rx_delay_us"] = rx_meta.rx_wall_us - timestamp_us
+        if timestamp_mono_us is not None:
+            imu["timestamp_mono_us"] = timestamp_mono_us
+        if record.sensor_mcu_tick_us is not None:
+            imu["sensor_mcu_tick_us"] = record.sensor_mcu_tick_us
+        if record.readout_mcu_tick_us is not None:
+            imu["readout_mcu_tick_us"] = record.readout_mcu_tick_us
         if record.mcu_tick_us is not None:
             imu["mcu_tick_us"] = record.mcu_tick_us
         if record.sample_timestamp is not None:
             imu["sample_timestamp"] = record.sample_timestamp
+        if record.time_status is not None:
+            imu["time_status"] = record.time_status
         if sync_quality is not None:
             sync_version = sync_quality.get("mapping_version")
             if sync_version is not None:
@@ -688,6 +731,9 @@ class BridgeClient:
         imu_record_callback: Optional[
             Callable[[int, list[IMUPushRecord], RXMetadata], None]
         ] = None,
+        sync_event_callback: Optional[
+            Callable[[int, list[SyncEventRecord], RXMetadata], None]
+        ] = None,
     ) -> None:
         self._port = port
         self._baud = baud
@@ -697,6 +743,7 @@ class BridgeClient:
             0.0 if imu_print_hz <= 0.0 else 1.0 / imu_print_hz
         )
         self._imu_record_callback = imu_record_callback
+        self._sync_event_callback = sync_event_callback
         self._serial: Optional[Serial] = None
         self._stop_event = threading.Event()
         self._rx_thread: Optional[threading.Thread] = None
@@ -718,6 +765,14 @@ class BridgeClient:
         ],
     ) -> None:
         self._imu_record_callback = callback
+
+    def set_sync_event_callback(
+        self,
+        callback: Optional[
+            Callable[[int, list[SyncEventRecord], RXMetadata], None]
+        ],
+    ) -> None:
+        self._sync_event_callback = callback
 
     def __enter__(self) -> "BridgeClient":
         self.open()
@@ -941,6 +996,9 @@ class BridgeClient:
         if cmd == CMD_IMU_DIAG_PUSH:
             self._handle_imu_diag_push(payload)
             return
+        if cmd == CMD_SYNC_EVENT_PUSH:
+            self._handle_sync_event_push(payload, rx_meta)
+            return
 
         resp_queue = self._response_queues.setdefault(cmd, queue.Queue())
         resp_queue.put((payload, rx_meta))
@@ -986,6 +1044,12 @@ class BridgeClient:
                     )
                 if record.sample_timestamp is not None:
                     parts.append(f"sample_ts={record.sample_timestamp}")
+                if record.sensor_mcu_tick_us is not None:
+                    parts.append(f"sensor_mcu_tick_us={record.sensor_mcu_tick_us}")
+                if record.readout_mcu_tick_us is not None:
+                    parts.append(f"readout_mcu_tick_us={record.readout_mcu_tick_us}")
+                if record.time_status is not None:
+                    parts.append(f"time_status=0x{record.time_status:02X}")
                 if record.has_motion_data():
                     parts.append(
                         f"acc=({record.acc_x:.3f},{record.acc_y:.3f},{record.acc_z:.3f})"
@@ -1058,6 +1122,7 @@ class BridgeClient:
             IMU_PUSH_POSE_RECORD_SIZE,
             IMU_PUSH_WIT_POSE_RECORD_SIZE,
             IMU_PUSH_YIS_POSE_RECORD_SIZE,
+            IMU_PUSH_YIS_EXTENDED_POSE_RECORD_SIZE,
             IMU_PUSH_EXTENDED_RECORD_SIZE,
         ):
             return None
@@ -1161,6 +1226,27 @@ class BridgeClient:
                 sample_timestamp=values[8],
             )
 
+        if len(payload) == IMU_PUSH_YIS_EXTENDED_POSE_RECORD_SIZE:
+            values = struct.unpack(
+                "<B" + ("f" * IMU_PUSH_POSE_FLOAT_COUNT) + "IQQB",
+                payload,
+            )
+            sensor_mcu_tick_us = values[9] if values[9] != 0 else None
+            return IMUPushRecord(
+                imu_addr=values[0],
+                roll_deg=values[1],
+                pitch_deg=values[2],
+                yaw_deg=values[3],
+                quat_w=values[4],
+                quat_x=values[5],
+                quat_y=values[6],
+                quat_z=values[7],
+                sample_timestamp=values[8],
+                sensor_mcu_tick_us=sensor_mcu_tick_us,
+                readout_mcu_tick_us=values[10],
+                time_status=values[11],
+            )
+
         if len(payload) == IMU_PUSH_EXTENDED_RECORD_SIZE:
             values = struct.unpack(
                 "<B" + ("f" * IMU_PUSH_EXTENDED_FLOAT_COUNT),
@@ -1215,6 +1301,70 @@ class BridgeClient:
             f"valid_count,{valid_count},"
             f"capacity,{capacity}",
         )
+
+    def _parse_sync_event_push(
+        self, payload: bytes
+    ) -> Optional[list[SyncEventRecord]]:
+        if len(payload) < 1:
+            return None
+        count = payload[0]
+        expected_len = 1 + count * SYNC_EVENT_RECORD_SIZE
+        if len(payload) != expected_len:
+            return None
+
+        events: list[SyncEventRecord] = []
+        offset = 1
+        for _ in range(count):
+            source, flags, _reserved, sequence, mcu_tick_us, nominal_period_us, dropped_count = struct.unpack_from(
+                "<BBHIQII",
+                payload,
+                offset,
+            )
+            events.append(
+                SyncEventRecord(
+                    source=source,
+                    flags=flags,
+                    sequence=sequence,
+                    mcu_tick_us=mcu_tick_us,
+                    nominal_period_us=nominal_period_us,
+                    dropped_count=dropped_count,
+                )
+            )
+            offset += SYNC_EVENT_RECORD_SIZE
+        return events
+
+    def _handle_sync_event_push(self, payload: bytes, rx_meta: RXMetadata) -> None:
+        events = self._parse_sync_event_push(payload)
+        if events is None:
+            print(
+                f"[bridge] invalid sync event length: {len(payload)}",
+                file=sys.stderr,
+                flush=True,
+            )
+            return
+
+        callback = self._sync_event_callback
+        if callback is not None and events:
+            ts_unix_ms = rx_meta.rx_wall_us // 1000
+            try:
+                callback(ts_unix_ms, events, rx_meta)
+            except Exception as exc:
+                print(f"[bridge] sync event callback error: {exc}", file=sys.stderr, flush=True)
+
+        if self._print_imu and events:
+            self._end_imu_single_line()
+            for event in events:
+                source_name = SYNC_EVENT_SOURCE_NAMES.get(event.source, f"source_{event.source}")
+                print(
+                    "sync_event,"
+                    f"source,{source_name},"
+                    f"seq,{event.sequence},"
+                    f"mcu_tick_us,{event.mcu_tick_us},"
+                    f"period_us,{event.nominal_period_us},"
+                    f"dropped,{event.dropped_count},"
+                    f"flags,0x{event.flags:02X}",
+                    flush=True,
+                )
 
 
 def send_ping(client: BridgeClient) -> None:
@@ -1539,6 +1689,10 @@ def cmd_capture(client: BridgeClient, args: argparse.Namespace) -> int:
     output_dir = os.path.dirname(output_path)
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
+    event_output_path = os.path.abspath(args.event_output)
+    event_output_dir = os.path.dirname(event_output_path)
+    if event_output_dir:
+        os.makedirs(event_output_dir, exist_ok=True)
     sync_path = os.path.abspath(args.sync_output)
     sync_mapper = TimeSyncMapper()
     sync_session = TimeSyncSession(
@@ -1582,7 +1736,24 @@ def cmd_capture(client: BridgeClient, args: argparse.Namespace) -> int:
             )
         else:
             print("time-sync periodic disabled: using initial mapping only")
-        with open(output_path, "w", encoding="utf-8", buffering=1) as f:
+        with open(output_path, "w", encoding="utf-8", buffering=1) as f, open(
+            event_output_path, "w", encoding="utf-8", newline="", buffering=1
+        ) as event_file:
+            event_writer = csv.writer(event_file)
+            event_writer.writerow(
+                [
+                    "source",
+                    "sequence",
+                    "mcu_tick_us",
+                    "timestamp_mono_us",
+                    "timestamp_us",
+                    "rx_timestamp_us",
+                    "nominal_period_us",
+                    "dropped_count",
+                    "flags",
+                    "sync_version",
+                ]
+            )
             f.write("[\n")
             first_row = True
 
@@ -1605,16 +1776,53 @@ def cmd_capture(client: BridgeClient, args: argparse.Namespace) -> int:
                 f.flush()
                 first_row = False
 
+            def _sync_event(
+                _ts_unix_ms: int,
+                events: list[SyncEventRecord],
+                rx_meta: RXMetadata,
+            ) -> None:
+                for event in events:
+                    timestamp_mono_us, timestamp_us, sync_quality = sync_mapper.map_to_times(
+                        event.mcu_tick_us,
+                        rx_meta,
+                    )
+                    source_name = SYNC_EVENT_SOURCE_NAMES.get(
+                        event.source, f"source_{event.source}"
+                    )
+                    sync_version = (
+                        sync_quality.get("mapping_version")
+                        if sync_quality is not None
+                        else None
+                    )
+                    event_writer.writerow(
+                        [
+                            source_name,
+                            event.sequence,
+                            event.mcu_tick_us,
+                            timestamp_mono_us,
+                            timestamp_us,
+                            rx_meta.rx_wall_us,
+                            event.nominal_period_us,
+                            event.dropped_count,
+                            f"0x{event.flags:02X}",
+                            sync_version,
+                        ]
+                    )
+                event_file.flush()
+
             client.set_imu_record_callback(_record)
+            client.set_sync_event_callback(_sync_event)
             while not stop_event.is_set():
                 time.sleep(0.2)
             client.set_imu_record_callback(None)
+            client.set_sync_event_callback(None)
             if not first_row:
                 f.write("\n")
             f.write("]\n")
             f.flush()
     finally:
         client.set_imu_record_callback(None)
+        client.set_sync_event_callback(None)
         sync_session.stop()
         signal.signal(signal.SIGINT, old_sigint)
         signal.signal(signal.SIGTERM, old_sigterm)
@@ -1733,6 +1941,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--sync-output",
         default="log/imu_time_sync.csv",
         help="output CSV path for raw time-sync samples",
+    )
+    capture_parser.add_argument(
+        "--event-output",
+        default="log/sync_events.csv",
+        help="output CSV path for TIM2/TIM5 sync event samples",
     )
     capture_parser.add_argument(
         "--sync-interval-s",

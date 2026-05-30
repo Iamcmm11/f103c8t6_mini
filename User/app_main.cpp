@@ -28,11 +28,24 @@ using namespace LibXR;
 #include "application/imu_uart_bridge_task.hpp"
 #include "application/yis_imu_acquisition_task.hpp"
 #include "managers/imu_manager.hpp"
+#include "managers/sync_signal_manager.hpp"
 #include "managers/ws2812_manager.hpp"
 #include "modules/yesense_yis_imu/yis_imu.hpp"
 #include "modules/ws2812/ws2812_strip.hpp"
 
 extern UART_HandleTypeDef huart5;
+
+extern "C" void app_on_tim2_period_elapsed(void) {
+  Manager::SyncSignalManager::RecordEventFromISR(
+      Manager::SyncEventSource::TIM2_CAMERA_TRIGGER_30HZ,
+      LibXR::Timebase::GetMicroseconds());
+}
+
+extern "C" void app_on_tim5_period_elapsed(void) {
+  Manager::SyncSignalManager::RecordEventFromISR(
+      Manager::SyncEventSource::TIM5_IMU_SYNC_1HZ,
+      LibXR::Timebase::GetMicroseconds());
+}
 
 extern "C" void app_on_tim6_period_elapsed(void) {
   Manager::IMUManager::OnHardwareTriggerTimerInterrupt(true);
@@ -72,6 +85,16 @@ uint32_t GetTim5ClockHz() {
   return clock_hz;
 }
 
+void EnableTimUpdateInterrupt(void* context) {
+  auto* timer = static_cast<TIM_HandleTypeDef*>(context);
+  if (timer == nullptr) {
+    return;
+  }
+
+  __HAL_TIM_CLEAR_FLAG(timer, TIM_FLAG_UPDATE);
+  __HAL_TIM_ENABLE_IT(timer, TIM_IT_UPDATE);
+}
+
 }  // namespace
 /* User Code End 1 */
 // NOLINTBEGIN
@@ -88,8 +111,8 @@ extern UART_HandleTypeDef huart5;
 
 /* DMA Resources */
 static uint8_t spi1_tx_buf[768];
-static uint8_t usart1_tx_buf[512];
-static uint8_t usart1_rx_buf[128];
+static uint8_t usart1_tx_buf[2048];
+static uint8_t usart1_rx_buf[512];
 static uint8_t i2c1_buf[96];
 
 extern "C" void app_main(void) {
@@ -124,7 +147,7 @@ extern "C" void app_main(void) {
   //             {nullptr, 0}, {nullptr, 0}, 5);
 
   STM32UART usart1(&huart1,
-              usart1_rx_buf, usart1_tx_buf, 5);
+              usart1_rx_buf, usart1_tx_buf, 16);
 
   STM32I2C i2c1(&hi2c1, i2c1_buf, 3);
 
@@ -143,6 +166,7 @@ extern "C" void app_main(void) {
   static ::Module::WS2812Strip ws2812_strip(&spi1);
   static ::Manager::WS2812Manager ws2812_manager;
   static ::Manager::IMUManager imu_manager(::Manager::ACTUAL_IMU_COUNT);
+  static ::Manager::SyncSignalManager sync_signal_manager;
   static ::Module::YISIMU yis_imu(&i2c1, yis_i2c_addr);
 
   // ========================================================================
@@ -166,7 +190,34 @@ extern "C" void app_main(void) {
                 static_cast<unsigned>(imu_manager.GetOnlineCount()));
   Uart5PrintLine(line);
 
-  const auto pwm_sync_ec = pwm_tim5_ch1.Enable();
+// 同步信号管理器统一管理通用的 PWM 启动与事件记录流程。
+// 该钩子函数用于在本板级层中配置 STM32 定时器更新中断。
+  ::Manager::SyncPwmOutputConfig imu_sync_output;
+  imu_sync_output.source = ::Manager::SyncEventSource::TIM5_IMU_SYNC_1HZ;
+  imu_sync_output.pwm = &pwm_tim5_ch1;
+  imu_sync_output.nominal_period_us = 1000000U;
+  imu_sync_output.before_enable = EnableTimUpdateInterrupt;
+  imu_sync_output.context = &htim5;
+  (void)sync_signal_manager.RegisterPwmOutput(imu_sync_output);
+
+// 定时器 2 控制相机触发信号；定时器 5 输出YIS 1 赫兹时间戳基准信号。
+  ::Manager::SyncPwmOutputConfig camera_trigger_output;
+  camera_trigger_output.source =
+      ::Manager::SyncEventSource::TIM2_CAMERA_TRIGGER_30HZ;
+  camera_trigger_output.pwm = &pwm_tim2_ch3;
+  camera_trigger_output.nominal_period_us = 33333U;
+  camera_trigger_output.before_enable = EnableTimUpdateInterrupt;
+  camera_trigger_output.context = &htim2;
+  (void)sync_signal_manager.RegisterPwmOutput(camera_trigger_output);
+
+  const auto sync_start_ec = sync_signal_manager.StartAll();
+  (void)sync_start_ec;
+  const auto pwm_sync_ec = sync_signal_manager.GetLastStartResult(
+      ::Manager::SyncEventSource::TIM5_IMU_SYNC_1HZ);
+  const auto pwm_camera_ec = sync_signal_manager.GetLastStartResult(
+      ::Manager::SyncEventSource::TIM2_CAMERA_TRIGGER_30HZ);
+
+
   const uint32_t tim5_clk_hz = GetTim5ClockHz();
   const uint32_t tim5_psc = static_cast<uint32_t>(htim5.Init.Prescaler) + 1U;
   const uint32_t tim5_arr = static_cast<uint32_t>(htim5.Init.Period) + 1U;
@@ -183,6 +234,22 @@ extern "C" void app_main(void) {
       static_cast<unsigned long>(htim5.Init.Period),
       static_cast<unsigned long>(tim5_ccr),
       static_cast<unsigned long>(sync_freq_hz));
+  Uart5PrintLine(line);
+
+  const uint32_t tim2_psc = static_cast<uint32_t>(htim2.Init.Prescaler) + 1U;
+  const uint32_t tim2_arr = static_cast<uint32_t>(htim2.Init.Period) + 1U;
+  const uint32_t tim2_ccr = __HAL_TIM_GET_COMPARE(&htim2, TIM_CHANNEL_3);
+  const uint32_t camera_freq_hz =
+      (tim2_psc != 0U && tim2_arr != 0U) ? (tim5_clk_hz / tim2_psc / tim2_arr)
+                                         : 0U;
+
+  std::snprintf(line, sizeof(line),
+                "[boot] camera pwm ec=%d psc=%lu arr=%lu ccr=%lu freq=%lu",
+                static_cast<int>(pwm_camera_ec),
+                static_cast<unsigned long>(htim2.Init.Prescaler),
+                static_cast<unsigned long>(htim2.Init.Period),
+                static_cast<unsigned long>(tim2_ccr),
+                static_cast<unsigned long>(camera_freq_hz));
   Uart5PrintLine(line);
 
   const auto yis_init_ec = yis_imu.Init();
@@ -209,10 +276,10 @@ extern "C" void app_main(void) {
   wit_acq_config.enabled_imu_count = 6;
 
   // YIS acquisition config: 200Hz, topic "yis_imu_pose",
-  // medium priority, 1024-byte stack.
+  // high priority, 1024-byte stack.
   ::Application::YISIMUAcquisitionConfig yis_config;
   yis_config.frequency_hz = 200;
-  yis_config.priority = static_cast<uint32_t>(LibXR::Thread::Priority::MEDIUM);
+  yis_config.priority = static_cast<uint32_t>(LibXR::Thread::Priority::HIGH);
   yis_config.stack_size = 1024;
   yis_config.dr_wait_timeout_ms = 20;
   yis_config.topic_name = "yis_imu_pose";
@@ -223,10 +290,11 @@ extern "C" void app_main(void) {
   ::Application::IMUUartBridgeConfig bridge_config;
   bridge_config.stream_relative_euler = false;    //字符流输出
   bridge_config.push_imu_euler_in_bridge = true;  //是否主动向 UART 推送姿态数据
+  bridge_config.push_sync_events_in_bridge = true; //是否主动向 UART 推送 TIM2/TIM5 同步事件
   bridge_config.pose_source = ::Application::BridgePoseSource::YIS;
   bridge_config.push_all_slots_in_bridge = false; //WIT 多 IMU 推送时，是否把无效槽位也打包进去
   bridge_config.wit_push_imu_count = wit_acq_config.enabled_imu_count;
-  bridge_config.stream_interval_ms = 0;
+  bridge_config.stream_interval_ms = 0;   //桥接推送频率不再设置为50hz或者200hz，根据底层数据输出频率决定，上层不加限制
   bridge_config.priority = static_cast<uint32_t>(LibXR::Thread::Priority::MEDIUM);
   bridge_config.stack_size = 1024;
 

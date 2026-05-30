@@ -3,6 +3,7 @@
 #include <cstdio>
 
 #include "FreeRTOS.h"
+#include "managers/sync_signal_manager.hpp"
 #include "stm32_timebase.hpp"
 #include "task.h"
 
@@ -12,6 +13,9 @@ namespace {
 
 constexpr uint32_t kTaskCreateOverheadBytes = 384;
 constexpr uint32_t kTaskCreateSafetyBytes = 256;
+constexpr uint8_t kYISTimeStatusHasEpoch = 0x01;
+constexpr uint8_t kYISTimeStatusSampleWrapSeen = 0x02;
+constexpr uint8_t kYISTimeStatusEpochMismatch = 0x04;
 
 uint32_t FrequencyToPeriodMs(uint32_t frequency_hz) {
   if (frequency_hz == 0U) {
@@ -85,6 +89,8 @@ LibXR::ErrorCode YISIMUAcquisitionTask::Start() {
   running_ = true;
   first_failure_logged_ = false;
   sample_count_ = 0;
+  last_dr_mcu_tick_us_ = 0;
+  last_sample_timestamp_ = 0;
   while (dr_sem_.Wait(0U) == LibXR::ErrorCode::OK) {
   }
   if (dr_gpio_ != nullptr) {
@@ -119,6 +125,15 @@ void YISIMUAcquisitionTask::Stop() {
 void YISIMUAcquisitionTask::OnDrInterrupt(bool in_isr,
                                           YISIMUAcquisitionTask* task) {
   if (task != nullptr) {
+    if (in_isr) {
+      const UBaseType_t interrupt_mask = taskENTER_CRITICAL_FROM_ISR();
+      task->last_dr_mcu_tick_us_ = LibXR::Timebase::GetMicroseconds();
+      taskEXIT_CRITICAL_FROM_ISR(interrupt_mask);
+    } else {
+      taskENTER_CRITICAL();
+      task->last_dr_mcu_tick_us_ = LibXR::Timebase::GetMicroseconds();
+      taskEXIT_CRITICAL();
+    }
     task->dr_sem_.PostFromCallback(in_isr);
   }
 }
@@ -144,6 +159,12 @@ void YISIMUAcquisitionTask::Run() {
 
     Manager::YISPoseMsg msg;
     msg.timestamp_us = LibXR::Timebase::GetMicroseconds();
+    taskENTER_CRITICAL();
+    const uint64_t last_dr_mcu_tick_us = last_dr_mcu_tick_us_;
+    taskEXIT_CRITICAL();
+    msg.readout_mcu_tick_us =
+        (last_dr_mcu_tick_us != 0U) ? last_dr_mcu_tick_us : msg.timestamp_us;
+    msg.sensor_mcu_tick_us = 0U;
     msg.euler[0] = 0.0f;
     msg.euler[1] = 0.0f;
     msg.euler[2] = 0.0f;
@@ -152,6 +173,7 @@ void YISIMUAcquisitionTask::Run() {
     msg.quaternion[2] = 0.0f;
     msg.quaternion[3] = 0.0f;
     msg.sample_timestamp = 0U;
+    msg.time_status = 0U;
 
     int32_t raw_quat[4] = {0, 0, 0, 0};
     float norm_sq = 0.0f;
@@ -177,6 +199,33 @@ void YISIMUAcquisitionTask::Run() {
 
     if (msg.status == 0U && sample_timestamp_ec != LibXR::ErrorCode::OK) {
       msg.sample_timestamp = 0U;
+    }
+    if (msg.status == 0U && sample_timestamp_ec == LibXR::ErrorCode::OK) {
+      Manager::SyncEventRecord epoch;
+      if (Manager::SyncSignalManager::GetLatestEvent(
+              Manager::SyncEventSource::TIM5_IMU_SYNC_1HZ, epoch)) {
+        msg.time_status = static_cast<uint8_t>(msg.time_status |
+                                               kYISTimeStatusHasEpoch);
+        const int64_t sensor_tick =
+            static_cast<int64_t>(epoch.mcu_tick_us) +
+            static_cast<int64_t>(msg.sample_timestamp) +
+            static_cast<int64_t>(config_.yis_epoch_offset_us);
+        msg.sensor_mcu_tick_us =
+            (sensor_tick > 0) ? static_cast<uint64_t>(sensor_tick) : 0U;
+
+        const uint64_t epoch_end =
+            epoch.mcu_tick_us + epoch.nominal_period_us + 2000U;
+        if (msg.sensor_mcu_tick_us > epoch_end) {
+          msg.time_status = static_cast<uint8_t>(msg.time_status |
+                                                 kYISTimeStatusEpochMismatch);
+        }
+      }
+      if (sample_count_ != 0U &&
+          msg.sample_timestamp < last_sample_timestamp_) {
+        msg.time_status = static_cast<uint8_t>(msg.time_status |
+                                               kYISTimeStatusSampleWrapSeen);
+      }
+      last_sample_timestamp_ = msg.sample_timestamp;
     }
 
     if (topic_ != nullptr) {
