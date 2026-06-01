@@ -25,7 +25,7 @@ struct SyncEventQueue {
 SyncEventQueue sync_event_queue;
 
 size_t SourceIndex(SyncEventSource source) {
-  return (source == SyncEventSource::TIM2_CAMERA_TRIGGER_30HZ) ? 1U : 0U;
+  return (source == SyncEventSource::TIM5_CAMERA_TRIGGER_30HZ) ? 1U : 0U;
 }
 
 uint32_t NominalPeriodUs(SyncEventSource source) {

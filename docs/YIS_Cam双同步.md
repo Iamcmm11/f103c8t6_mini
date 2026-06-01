@@ -8,23 +8,23 @@
 
 ## 同步信号
 
-- `TIM5_IMU_SYNC_1HZ`
+- `TIM2_IMU_SYNC_1HZ`
   - 1Hz 同步脉冲。
   - 作为 YIS `sample_timestamp` 的 epoch 锚点。
   - 每次事件记录：
     ```text
-    source = TIM5_IMU_SYNC_1HZ
+    source = TIM2_IMU_SYNC_1HZ
     sequence
     mcu_tick_us
     nominal_period_us = 1000000
     ```
 
-- `TIM2_CAMERA_TRIGGER_30HZ`
+- `TIM5_CAMERA_TRIGGER_30HZ`
   - 约 30Hz 相机触发脉冲。
   - 事件时间 `mcu_tick_us` 作为相机曝光上升沿时间。
   - 每次事件记录：
     ```text
-    source = TIM2_CAMERA_TRIGGER_30HZ
+    source = TIM5_CAMERA_TRIGGER_30HZ
     sequence
     mcu_tick_us
     nominal_period_us = 33333
@@ -32,10 +32,10 @@
 
 ## YIS 采样时间
 
-YIS 原始 `sample_timestamp` 表示当前 1Hz 同步周期内的微秒偏移。正式采样时间不用 PA1 DR/读取时间，而是用最新 TIM5 epoch 重建：
+YIS 原始 `sample_timestamp` 表示当前 1Hz 同步周期内的微秒偏移。正式采样时间不用 PB8 DR/读取时间，而是用最新 TIM2 epoch 重建：
 
 ```text
-sensor_mcu_tick_us = latest_TIM5_epoch_mcu_tick_us
+sensor_mcu_tick_us = latest_TIM2_epoch_mcu_tick_us
                    + sample_timestamp
                    + yis_epoch_offset_us
 ```
@@ -45,11 +45,11 @@ sensor_mcu_tick_us = latest_TIM5_epoch_mcu_tick_us
 ```text
 sample_timestamp       YIS 周期内原始微秒偏移
 sensor_mcu_tick_us     正式 YIS 采样时间，NV 对齐优先使用
-readout_mcu_tick_us    PA1 DR/读取附近时间，仅用于诊断
+readout_mcu_tick_us    PB8 DR/读取附近时间，仅用于诊断
 time_status            bit0=has_epoch, bit1=sample_wrap_seen, bit2=epoch_mismatch
 ```
 
-当还没有 TIM5 epoch 时：
+当还没有 TIM2 epoch 时：
 
 ```text
 sensor_mcu_tick_us = 0
@@ -99,7 +99,7 @@ YIS 数据：
 
 Camera 数据：
 
-- 使用 `TIM2_CAMERA_TRIGGER_30HZ` 事件的 `mcu_tick_us` 映射生成相机触发 `timestamp_us`。
+- 使用 `TIM5_CAMERA_TRIGGER_30HZ` 事件的 `mcu_tick_us` 映射生成相机触发 `timestamp_us`。
 - `sync_events.csv.timestamp_us` 可直接与视频侧 `wall_us` 对齐。
 
 落盘字段：
@@ -127,8 +127,8 @@ sync_events.csv:
 
 ## 验收标准
 
-- TIM5 同步事件约 1 条/秒，连续事件 `mcu_tick_us` 差值约 `1000000 us`。
-- TIM2 相机触发事件约 30 条/秒，连续事件 `mcu_tick_us` 差值约 `33333 us`。
+- TIM2 同步事件约 1 条/秒，连续事件 `mcu_tick_us` 差值约 `1000000 us`。
+- TIM5 相机触发事件约 30 条/秒，连续事件 `mcu_tick_us` 差值约 `33333 us`。
 - `dropped_count` 长时间不增长，`flags` 不持续出现 overflow。
 - YIS `sensor_mcu_tick_us` 跨秒单调递增。
 - `sync-monitor` 完整周期稳定为：
@@ -140,8 +140,8 @@ sync_events.csv:
 
 ## Assumptions
 
-- YIS `sample_timestamp` 是相对 TIM5 1Hz 同步周期的周期内微秒偏移。
-- TIM5 上升沿是 YIS sample timestamp 的 epoch 参考点。
+- YIS `sample_timestamp` 是相对 TIM2 1Hz 同步周期的周期内微秒偏移。
+- TIM2 上升沿是 YIS sample timestamp 的 epoch 参考点。
 - `yis_epoch_offset_us` 初始为 0，后续可按实测校准。
-- 相机曝光以 TIM2 上升沿作为触发参考。
+- 相机曝光以 TIM5 上升沿作为触发参考。
 - 200Hz YIS + 30Hz event 推送建议使用 `460800` 或 `921600` 波特率。

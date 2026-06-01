@@ -13,13 +13,16 @@ GPIO:
     Signal: GPIO_Output
   PB4:
     Signal: GPIO_Output
+  PB8:
+    Signal: GPXTI8
+    GPXTI: true
   PC10:
     Signal: GPIO_Output
 Peripherals:
   TIM:
     TIM2:
-      Period: 3332
-      Prescaler: 639
+      Period: 9999
+      Prescaler: 6399
       Channels:
         CH3:
           Label: TIM2
@@ -27,8 +30,8 @@ Peripherals:
           Complementary: false
           DutyCycle: null
     TIM5:
-      Period: 9999
-      Prescaler: 6399
+      Period: 3332
+      Prescaler: 639
       Channels:
         CH1:
           Label: TIM5

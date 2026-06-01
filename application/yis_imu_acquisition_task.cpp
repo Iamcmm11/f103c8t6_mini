@@ -203,7 +203,7 @@ void YISIMUAcquisitionTask::Run() {
     if (msg.status == 0U && sample_timestamp_ec == LibXR::ErrorCode::OK) {
       Manager::SyncEventRecord epoch;
       if (Manager::SyncSignalManager::GetLatestEvent(
-              Manager::SyncEventSource::TIM5_IMU_SYNC_1HZ, epoch)) {
+              Manager::SyncEventSource::TIM2_IMU_SYNC_1HZ, epoch)) {
         msg.time_status = static_cast<uint8_t>(msg.time_status |
                                                kYISTimeStatusHasEpoch);
         const int64_t sensor_tick =

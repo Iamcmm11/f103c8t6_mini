@@ -9,12 +9,12 @@
 namespace Manager {
 
 enum class SyncEventSource : uint8_t {
-  TIM5_IMU_SYNC_1HZ = 1,
-  TIM2_CAMERA_TRIGGER_30HZ = 2,
+  TIM2_IMU_SYNC_1HZ = 1,
+  TIM5_CAMERA_TRIGGER_30HZ = 2,
 };
 
 struct SyncEventRecord {
-  SyncEventSource source = SyncEventSource::TIM5_IMU_SYNC_1HZ;
+  SyncEventSource source = SyncEventSource::TIM2_IMU_SYNC_1HZ;
   uint8_t flags = 0;
   uint16_t reserved = 0;
   uint32_t sequence = 0;
@@ -24,7 +24,7 @@ struct SyncEventRecord {
 };
 
 struct SyncPwmOutputConfig {
-  SyncEventSource source = SyncEventSource::TIM5_IMU_SYNC_1HZ;
+  SyncEventSource source = SyncEventSource::TIM2_IMU_SYNC_1HZ;
   LibXR::PWM* pwm = nullptr;
   uint32_t nominal_period_us = 0;
   void (*before_enable)(void*) = nullptr;

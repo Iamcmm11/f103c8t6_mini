@@ -37,13 +37,13 @@ extern UART_HandleTypeDef huart5;
 
 extern "C" void app_on_tim2_period_elapsed(void) {
   Manager::SyncSignalManager::RecordEventFromISR(
-      Manager::SyncEventSource::TIM2_CAMERA_TRIGGER_30HZ,
+      Manager::SyncEventSource::TIM2_IMU_SYNC_1HZ,
       LibXR::Timebase::GetMicroseconds());
 }
 
 extern "C" void app_on_tim5_period_elapsed(void) {
   Manager::SyncSignalManager::RecordEventFromISR(
-      Manager::SyncEventSource::TIM5_IMU_SYNC_1HZ,
+      Manager::SyncEventSource::TIM5_CAMERA_TRIGGER_30HZ,
       LibXR::Timebase::GetMicroseconds());
 }
 
@@ -128,12 +128,12 @@ extern "C" void app_main(void) {
   STM32PowerManager power_manager;
 
   /* GPIO Configuration */
-  STM32GPIO PA1(GPIOA, GPIO_PIN_1, EXTI1_IRQn);
   STM32GPIO PA15(GPIOA, GPIO_PIN_15);
   STM32GPIO PA4(GPIOA, GPIO_PIN_4);
   STM32GPIO PA6(GPIOA, GPIO_PIN_6, EXTI9_5_IRQn);
   STM32GPIO PB3(GPIOB, GPIO_PIN_3);
   STM32GPIO PB4(GPIOB, GPIO_PIN_4);
+  STM32GPIO PB8(GPIOB, GPIO_PIN_8, EXTI9_5_IRQn);
   STM32GPIO PC10(GPIOC, GPIO_PIN_10);
 
 
@@ -147,7 +147,7 @@ extern "C" void app_main(void) {
   //             {nullptr, 0}, {nullptr, 0}, 5);
 
   STM32UART usart1(&huart1,
-              usart1_rx_buf, usart1_tx_buf, 16);
+              usart1_rx_buf, usart1_tx_buf, 5);
 
   STM32I2C i2c1(&hi2c1, i2c1_buf, 3);
 
@@ -193,29 +193,29 @@ extern "C" void app_main(void) {
 // 同步信号管理器统一管理通用的 PWM 启动与事件记录流程。
 // 该钩子函数用于在本板级层中配置 STM32 定时器更新中断。
   ::Manager::SyncPwmOutputConfig imu_sync_output;
-  imu_sync_output.source = ::Manager::SyncEventSource::TIM5_IMU_SYNC_1HZ;
-  imu_sync_output.pwm = &pwm_tim5_ch1;
+  imu_sync_output.source = ::Manager::SyncEventSource::TIM2_IMU_SYNC_1HZ;
+  imu_sync_output.pwm = &pwm_tim2_ch3;
   imu_sync_output.nominal_period_us = 1000000U;
   imu_sync_output.before_enable = EnableTimUpdateInterrupt;
-  imu_sync_output.context = &htim5;
+  imu_sync_output.context = &htim2;
   (void)sync_signal_manager.RegisterPwmOutput(imu_sync_output);
 
-// 定时器 2 控制相机触发信号；定时器 5 输出YIS 1 赫兹时间戳基准信号。
+// 定时器 5 控制相机触发信号；定时器 2 输出 YIS 1 赫兹时间戳基准信号。
   ::Manager::SyncPwmOutputConfig camera_trigger_output;
   camera_trigger_output.source =
-      ::Manager::SyncEventSource::TIM2_CAMERA_TRIGGER_30HZ;
-  camera_trigger_output.pwm = &pwm_tim2_ch3;
+      ::Manager::SyncEventSource::TIM5_CAMERA_TRIGGER_30HZ;
+  camera_trigger_output.pwm = &pwm_tim5_ch1;
   camera_trigger_output.nominal_period_us = 33333U;
   camera_trigger_output.before_enable = EnableTimUpdateInterrupt;
-  camera_trigger_output.context = &htim2;
+  camera_trigger_output.context = &htim5;
   (void)sync_signal_manager.RegisterPwmOutput(camera_trigger_output);
 
   const auto sync_start_ec = sync_signal_manager.StartAll();
   (void)sync_start_ec;
   const auto pwm_sync_ec = sync_signal_manager.GetLastStartResult(
-      ::Manager::SyncEventSource::TIM5_IMU_SYNC_1HZ);
+      ::Manager::SyncEventSource::TIM2_IMU_SYNC_1HZ);
   const auto pwm_camera_ec = sync_signal_manager.GetLastStartResult(
-      ::Manager::SyncEventSource::TIM2_CAMERA_TRIGGER_30HZ);
+      ::Manager::SyncEventSource::TIM5_CAMERA_TRIGGER_30HZ);
 
 
   const uint32_t tim5_clk_hz = GetTim5ClockHz();
@@ -283,7 +283,7 @@ extern "C" void app_main(void) {
   yis_config.stack_size = 1024;
   yis_config.dr_wait_timeout_ms = 20;
   yis_config.topic_name = "yis_imu_pose";
-  static ::Application::YISIMUAcquisitionTask yis_task(&yis_imu, yis_config, &PA1);
+  static ::Application::YISIMUAcquisitionTask yis_task(&yis_imu, yis_config, &PB8);
 
   // Bridge config: 20ms push period, medium priority, 1024-byte stack.
   // Select bridge pose source here: WIT or YIS.
