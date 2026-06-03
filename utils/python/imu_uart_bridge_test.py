@@ -93,7 +93,8 @@ IMU_PUSH_WIT_POSE_RECORD_SIZE = struct.calcsize(
     "<B" + ("f" * IMU_PUSH_POSE_FLOAT_COUNT) + "Q"
 )
 IMU_PUSH_WIT_COMPACT_HEADER_SIZE = struct.calcsize("<BQ")
-IMU_PUSH_WIT_COMPACT_RECORD_SIZE = struct.calcsize("<B H hhh hhhh")
+IMU_PUSH_WIT_COMPACT_RECORD_SIZE_LEGACY = struct.calcsize("<B H hhh hhhh")
+IMU_PUSH_WIT_COMPACT_RECORD_SIZE = struct.calcsize("<B H hhh hhhh hhh")
 IMU_PUSH_YIS_POSE_RECORD_SIZE = struct.calcsize(
     "<B" + ("f" * IMU_PUSH_POSE_FLOAT_COUNT) + "I"
 )
@@ -138,6 +139,9 @@ class IMUPushRecord:
     gyro_x: float = math.nan
     gyro_y: float = math.nan
     gyro_z: float = math.nan
+    mag_x: float = math.nan
+    mag_y: float = math.nan
+    mag_z: float = math.nan
     quat_w: float = math.nan
     quat_x: float = math.nan
     quat_y: float = math.nan
@@ -148,6 +152,9 @@ class IMUPushRecord:
 
     def has_quaternion(self) -> bool:
         return not math.isnan(self.quat_w)
+
+    def has_magnetometer(self) -> bool:
+        return not math.isnan(self.mag_x)
 
 
 @dataclass(frozen=True)
@@ -713,6 +720,16 @@ def format_imu_json_row(
             if gyro:
                 imu["gyro"] = gyro
 
+        if record.has_magnetometer():
+            mag = {
+                "x": _round_or_none(record.mag_x),
+                "y": _round_or_none(record.mag_y),
+                "z": _round_or_none(record.mag_z),
+            }
+            mag = {key: value for key, value in mag.items() if value is not None}
+            if mag:
+                imu["mag"] = mag
+
         imus.append(imu)
 
     row: dict = {
@@ -1066,6 +1083,10 @@ class BridgeClient:
                         parts.append(
                             f"gyro=({record.gyro_x:.3f},{record.gyro_y:.3f},{record.gyro_z:.3f})"
                         )
+                if record.has_magnetometer():
+                    parts.append(
+                        f"mag=({record.mag_x:.0f},{record.mag_y:.0f},{record.mag_z:.0f})"
+                    )
                 if record.has_quaternion():
                     parts.append(
                         f"quat=({record.quat_w:.4f},{record.quat_x:.4f},{record.quat_y:.4f},{record.quat_z:.4f})"
@@ -1103,18 +1124,29 @@ class BridgeClient:
             len(payload)
             == IMU_PUSH_WIT_COMPACT_HEADER_SIZE
             + imu_count * IMU_PUSH_WIT_COMPACT_RECORD_SIZE
+        ) or (
+            len(payload)
+            == IMU_PUSH_WIT_COMPACT_HEADER_SIZE
+            + imu_count * IMU_PUSH_WIT_COMPACT_RECORD_SIZE_LEGACY
         ):
             _count, base_tick_us = struct.unpack_from("<BQ", payload, 0)
             imu_records: list[IMUPushRecord] = []
             offset = IMU_PUSH_WIT_COMPACT_HEADER_SIZE
+            record_size = (
+                IMU_PUSH_WIT_COMPACT_RECORD_SIZE
+                if len(payload)
+                == IMU_PUSH_WIT_COMPACT_HEADER_SIZE
+                + imu_count * IMU_PUSH_WIT_COMPACT_RECORD_SIZE
+                else IMU_PUSH_WIT_COMPACT_RECORD_SIZE_LEGACY
+            )
             for _ in range(imu_count):
                 imu_records.append(
                     self._unpack_wit_compact_record(
-                        payload[offset : offset + IMU_PUSH_WIT_COMPACT_RECORD_SIZE],
+                        payload[offset : offset + record_size],
                         base_tick_us,
                     )
                 )
-                offset += IMU_PUSH_WIT_COMPACT_RECORD_SIZE
+                offset += record_size
             return imu_records
 
         records_raw = payload[1:]
@@ -1144,19 +1176,38 @@ class BridgeClient:
     def _unpack_wit_compact_record(
         self, payload: bytes, base_tick_us: int
     ) -> IMUPushRecord:
-        if len(payload) != IMU_PUSH_WIT_COMPACT_RECORD_SIZE:
+        if len(payload) == IMU_PUSH_WIT_COMPACT_RECORD_SIZE:
+            (
+                imu_addr,
+                tick_delta_us,
+                acc_x_mg,
+                acc_y_mg,
+                acc_z_mg,
+                quat_w_q15,
+                quat_x_q15,
+                quat_y_q15,
+                quat_z_q15,
+                mag_x,
+                mag_y,
+                mag_z,
+            ) = struct.unpack("<B H hhh hhhh hhh", payload)
+        elif len(payload) == IMU_PUSH_WIT_COMPACT_RECORD_SIZE_LEGACY:
+            (
+                imu_addr,
+                tick_delta_us,
+                acc_x_mg,
+                acc_y_mg,
+                acc_z_mg,
+                quat_w_q15,
+                quat_x_q15,
+                quat_y_q15,
+                quat_z_q15,
+            ) = struct.unpack("<B H hhh hhhh", payload)
+            mag_x = math.nan
+            mag_y = math.nan
+            mag_z = math.nan
+        else:
             raise ValueError(f"unsupported compact imu record size: {len(payload)}")
-        (
-            imu_addr,
-            tick_delta_us,
-            acc_x_mg,
-            acc_y_mg,
-            acc_z_mg,
-            quat_w_q15,
-            quat_x_q15,
-            quat_y_q15,
-            quat_z_q15,
-        ) = struct.unpack("<B H hhh hhhh", payload)
         gravity_mps2 = 9.80665
         return IMUPushRecord(
             imu_addr=imu_addr,
@@ -1171,6 +1222,9 @@ class BridgeClient:
             quat_x=quat_x_q15 / 32767.0,
             quat_y=quat_y_q15 / 32767.0,
             quat_z=quat_z_q15 / 32767.0,
+            mag_x=mag_x,
+            mag_y=mag_y,
+            mag_z=mag_z,
         )
 
     def _unpack_imu_record(self, payload: bytes) -> IMUPushRecord:

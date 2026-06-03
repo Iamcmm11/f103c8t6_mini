@@ -39,7 +39,7 @@ constexpr uint8_t kBridgeWITTimestampSize = sizeof(uint64_t);
 constexpr uint8_t kBridgeWITCompactHeaderSize = sizeof(uint8_t) + sizeof(uint64_t);
 constexpr uint8_t kBridgeWITCompactRecordSize =
     static_cast<uint8_t>(sizeof(uint8_t) + sizeof(uint16_t) +
-                         (3U + 4U) * sizeof(int16_t));
+                         (3U + 4U + 3U) * sizeof(int16_t));
 constexpr uint8_t kBridgeTimeSyncSeqSize = sizeof(uint32_t);
 constexpr uint8_t kBridgeTimeSyncRespPayloadSize = static_cast<uint8_t>(
     1 + kBridgeTimeSyncSeqSize + sizeof(uint64_t) + sizeof(uint64_t));
@@ -449,18 +449,26 @@ IMUUartBridgeTask::PublishResult IMUUartBridgeTask::PublishBridgePoseData() {
 
       std::array<int16_t, 3> acc_mg = {0, 0, 0};
       std::array<int16_t, 4> quat_q15 = {0, 0, 0, 0};
+      std::array<int16_t, 3> mag_raw = {0, 0, 0};
       if (valid) {
         acc_mg = {AccMps2ToMilliG(imu.acc[0]), AccMps2ToMilliG(imu.acc[1]),
                   AccMps2ToMilliG(imu.acc[2])};
         quat_q15 = {QuatToQ15(imu.quaternion[0]), QuatToQ15(imu.quaternion[1]),
                     QuatToQ15(imu.quaternion[2]),
                     QuatToQ15(imu.quaternion[3])};
+        mag_raw = {FloatToInt16Clamped(imu.mag[0]),
+                   FloatToInt16Clamped(imu.mag[1]),
+                   FloatToInt16Clamped(imu.mag[2])};
       }
       for (const int16_t value : acc_mg) {
         std::memcpy(payload.data() + cursor, &value, sizeof(value));
         cursor = static_cast<uint16_t>(cursor + sizeof(value));
       }
       for (const int16_t value : quat_q15) {
+        std::memcpy(payload.data() + cursor, &value, sizeof(value));
+        cursor = static_cast<uint16_t>(cursor + sizeof(value));
+      }
+      for (const int16_t value : mag_raw) {
         std::memcpy(payload.data() + cursor, &value, sizeof(value));
         cursor = static_cast<uint16_t>(cursor + sizeof(value));
       }
