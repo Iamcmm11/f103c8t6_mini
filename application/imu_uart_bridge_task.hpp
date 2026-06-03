@@ -72,6 +72,9 @@ class IMUUartBridgeTask {
   void ResetCommandParser();
   PublishResult PublishBridgePoseData();
   void PublishSyncEvents();
+  bool SetStreamingEnabled(bool enable);
+  void ClearPendingPushData();
+  void ClearPendingPoseData();
   bool WriteString(const char* str);
   bool WriteExact(const uint8_t* buf, uint16_t len);
   bool WriteSPI(const uint8_t* buf, uint16_t len);
@@ -89,6 +92,8 @@ class IMUUartBridgeTask {
                            uint16_t payload_len);
   void HandleTimeSync(uint8_t cmd, const uint8_t* payload,
                       uint16_t payload_len);
+  void HandleStreamControl(uint8_t cmd, const uint8_t* payload,
+                           uint16_t payload_len);
   uint8_t CalcSum(const uint8_t* buf, uint16_t len) const;
 
   static constexpr uint16_t kCommandPayloadBufferSize = 1024;
@@ -101,6 +106,7 @@ class IMUUartBridgeTask {
   IMUUartBridgeConfig config_;
   bool running_;
   uint32_t last_pose_push_ms_;
+  bool streaming_enabled_;
   LibXR::Thread* thread_;
   LibXR::Topic::ASyncSubscriber<Manager::IMUArrayMsg>* wit_subscriber_;
   LibXR::LockFreeQueue<Manager::YISPoseMsg>* yis_queue_;

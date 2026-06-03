@@ -35,12 +35,19 @@ class SyncSignalManager {
  public:
   LibXR::ErrorCode RegisterPwmOutput(const SyncPwmOutputConfig& config);
   LibXR::ErrorCode StartAll();
+  LibXR::ErrorCode StopAll();
   LibXR::ErrorCode GetLastStartResult(SyncEventSource source) const;
 
+  static LibXR::ErrorCode StartRegisteredOutputs();
+  static LibXR::ErrorCode StopRegisteredOutputs();
   static void RecordEventFromISR(SyncEventSource source, uint64_t mcu_tick_us);
   static void RecordEvent(SyncEventSource source, uint64_t mcu_tick_us);
   static bool GetLatestEvent(SyncEventSource source, SyncEventRecord& event);
   static bool PopEvent(SyncEventRecord& event);
+  static bool IsActive();
+  static uint32_t GetSessionId();
+  static uint64_t GetSessionStartMcuTickUs();
+  static uint64_t ToSessionTickUs(uint64_t absolute_mcu_tick_us);
 
  private:
   static constexpr size_t kMaxPwmOutputs = 4;

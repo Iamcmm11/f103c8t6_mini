@@ -3,30 +3,35 @@
 Host-side tool for the STM32 UART bridge.
 
 Run from repo root with utils/python path:
-  python utils/python/imu_uart_bridge_test.py --port COM13 ping  python utils/python/imu_uart_bridge_test.py --port COM13 rgb 135 206 250
+  python utils/python/imu_uart_bridge_test.py --port COM13 ping
+  python utils/python/imu_uart_bridge_test.py --port COM13 start
+  python utils/python/imu_uart_bridge_test.py --port COM13 stop
+  python utils/python/imu_uart_bridge_test.py --port COM13 rgb 135 206 250
   python utils/python/imu_uart_bridge_test.py --port COM13 led 3 255 0 0
   python utils/python/imu_uart_bridge_test.py --port COM13 off
   python utils/python/imu_uart_bridge_test.py --port COM13 blink 135 206 250 --delay-ms 300
   python utils/python/imu_uart_bridge_test.py --port COM13 led-blink 3 255 0 0 --delay-ms 300
   python utils/python/imu_uart_bridge_test.py --port COM13 console
-  python utils/python/imu_uart_bridge_test.py --port COM13 --baud 115200 sync-monitor
+  python utils/python/imu_uart_bridge_test.py --port COM13 --baud 460800 sync-monitor
 Run from repo root with scripts path:
   python scripts/imu_uart_bridge_test.py --port /dev/ttyTHS1 ping
+  python scripts/imu_uart_bridge_test.py --port /dev/ttyTHS1 start
+  python scripts/imu_uart_bridge_test.py --port /dev/ttyTHS1 stop
   python scripts/imu_uart_bridge_test.py --port /dev/ttyTHS1 rgb 135 206 250
-  python scripts/imu_uart_bridge_test.py --port /dev/ttyTHS1 led 3 254 0 0
-  python scripts/imu_uart_bridge_test.py --port /dev/ttyTHS1 
+  python scripts/imu_uart_bridge_test.py --port /dev/ttyTHS1 led 3 255 0 0
+  python scripts/imu_uart_bridge_test.py --port /dev/ttyTHS1 off
   
   python scripts/imu_uart_bridge_test.py --port /dev/ttyTHS1 blink 135 206 250 --delay-ms 300
   python scripts/imu_uart_bridge_test.py --port /dev/ttyTHS1 led-blink 3 255 0 0 --delay-ms 300
   python scripts/imu_uart_bridge_test.py --port /dev/ttyTHS1 console
   
-  python utils/python/imu_uart_bridge_test.py --port /dev/ttyTHS1 --baud 115200 sync-monitor
+  python utils/python/imu_uart_bridge_test.py --port /dev/ttyTHS1 --baud 460800 sync-monitor
 
 Short soft-sync capture test:
   mkdir -p sessions/imu_softsync_test log
   python3 scripts/imu_uart_bridge_test.py \
     --port /dev/ttyTCU0 \
-    --baud 115200 \
+    --baud 460800 \
     capture \
     --output sessions/imu_softsync_test/imu_uart_bridge.json \
     --sync-output log/imu_softsync_test_time_sync.csv \
@@ -66,6 +71,7 @@ SOF1 = 0xAA
 
 CMD_PING = 0x01
 CMD_TIME_SYNC = 0x02
+CMD_STREAM_CONTROL = 0x03
 CMD_WS2812_CONTROL = 0x21
 CMD_IMU_EULER_PUSH = 0x30
 CMD_IMU_DIAG_PUSH = 0x31
@@ -755,6 +761,7 @@ class BridgeClient:
         self._response_queues = {
             CMD_PING: queue.Queue(),
             CMD_TIME_SYNC: queue.Queue(),
+            CMD_STREAM_CONTROL: queue.Queue(),
             CMD_WS2812_CONTROL: queue.Queue(),
         }
 
@@ -1373,6 +1380,78 @@ def send_ping(client: BridgeClient) -> None:
         raise RuntimeError(f"ping failed, payload={payload.hex(' ')}")
 
 
+def parse_stream_control_response(payload: bytes) -> tuple[int, int, bool]:
+    if len(payload) == 1:
+        return payload[0], 0, False
+    if len(payload) != struct.calcsize("<BIB"):
+        raise RuntimeError(
+            f"unexpected stream-control response length: {len(payload)}, "
+            f"payload={payload.hex(' ')}"
+        )
+    status, seq, active = struct.unpack("<BIB", payload)
+    return status, seq, bool(active)
+
+
+def send_stream_control(
+    client: BridgeClient,
+    action: str,
+    *,
+    retries: int = 5,
+    timeout_s: float = 0.5,
+    retry_delay_s: float = 0.05,
+) -> bool:
+    action = action.lower()
+    if action not in {"start", "stop"}:
+        raise ValueError(f"unsupported stream action: {action}")
+    if retries < 1:
+        raise ValueError("retries must be >= 1")
+
+    seq = time.monotonic_ns() & 0xFFFFFFFF
+    payload = struct.pack("<I", seq) + action.encode("ascii")
+    last_error: Optional[Exception] = None
+    for attempt in range(1, retries + 1):
+        try:
+            resp = client.request(CMD_STREAM_CONTROL, payload, timeout=timeout_s)
+            status, resp_seq, active = parse_stream_control_response(resp)
+            if resp_seq != seq:
+                raise TimeoutError(
+                    f"stream-control seq mismatch: req={seq}, resp={resp_seq}"
+                )
+            if status != STATUS_OK:
+                raise RuntimeError(
+                    f"stream-control returned error status={status}, action={action}"
+                )
+            return active
+        except TimeoutError as exc:
+            last_error = exc
+            if attempt < retries:
+                time.sleep(retry_delay_s)
+
+    raise TimeoutError(
+        f"stream-control {action} not acknowledged after {retries} attempts"
+    ) from last_error
+
+
+def send_stream_start(client: BridgeClient, args: argparse.Namespace) -> bool:
+    return send_stream_control(
+        client,
+        "start",
+        retries=args.control_retries,
+        timeout_s=args.control_timeout_s,
+        retry_delay_s=args.control_retry_delay_s,
+    )
+
+
+def send_stream_stop(client: BridgeClient, args: argparse.Namespace) -> bool:
+    return send_stream_control(
+        client,
+        "stop",
+        retries=args.control_retries,
+        timeout_s=args.control_timeout_s,
+        retry_delay_s=args.control_retry_delay_s,
+    )
+
+
 def send_light_control(
     client: BridgeClient,
     target: int,
@@ -1434,6 +1513,18 @@ def send_light_control_checked(
 def cmd_ping(client: BridgeClient, _args: argparse.Namespace) -> int:
     send_ping(client)
     print("PING ok")
+    return 0
+
+
+def cmd_start(client: BridgeClient, args: argparse.Namespace) -> int:
+    active = send_stream_start(client, args)
+    print(f"STREAM start ok, active={int(active)}")
+    return 0
+
+
+def cmd_stop(client: BridgeClient, args: argparse.Namespace) -> int:
+    active = send_stream_stop(client, args)
+    print(f"STREAM stop ok, active={int(active)}")
     return 0
 
 
@@ -1503,7 +1594,7 @@ def cmd_led_blink(client: BridgeClient, args: argparse.Namespace) -> int:
 def cmd_console(client: BridgeClient, args: argparse.Namespace) -> int:
     print("Console mode started. IMU push will print automatically.")
     print(
-        "Commands: ping | off | rgb R G B | led I R G B | "
+        "Commands: ping | start | stream-stop | off | rgb R G B | led I R G B | "
         "blink R G B [delay_ms|--delay-ms N] | "
         "led-blink I R G B [delay_ms|--delay-ms N] | stop | quit"
     )
@@ -1526,6 +1617,12 @@ def cmd_console(client: BridgeClient, args: argparse.Namespace) -> int:
             if cmd == "ping":
                 send_ping(client)
                 print("PING ok")
+            elif cmd == "start":
+                active = send_stream_start(client, args)
+                print(f"STREAM start ok: active={int(active)}")
+            elif cmd in {"stream-stop", "stream_stop"}:
+                active = send_stream_stop(client, args)
+                print(f"STREAM stop ok: active={int(active)}")
             elif cmd == "off":
                 send_light_control_checked(client, TARGET_ALL_LEDS, 0, 0, 0)
                 print("OFF ok")
@@ -1598,15 +1695,22 @@ def cmd_console(client: BridgeClient, args: argparse.Namespace) -> int:
 
 
 def cmd_monitor(client: BridgeClient, _args: argparse.Namespace) -> int:
+    send_stream_start(client, _args)
     print("Monitor mode started. Waiting for IMU push frames, press Ctrl+C to stop.")
     try:
         while True:
             time.sleep(0.2)
     except KeyboardInterrupt:
         return 0
+    finally:
+        try:
+            send_stream_stop(client, _args)
+        except Exception as exc:
+            print(f"stream-control stop warning: {exc}", file=sys.stderr, flush=True)
 
 
 def cmd_sync_monitor(client: BridgeClient, _args: argparse.Namespace) -> int:
+    send_stream_start(client, _args)
     print("Sync-monitor mode started. Waiting for sample_timestamp resets, press Ctrl+C to stop.")
     sync_states: dict[int, SyncCycleStats] = {}
 
@@ -1648,6 +1752,10 @@ def cmd_sync_monitor(client: BridgeClient, _args: argparse.Namespace) -> int:
         return 0
     finally:
         client.set_imu_record_callback(None)
+        try:
+            send_stream_stop(client, _args)
+        except Exception as exc:
+            print(f"stream-control stop warning: {exc}", file=sys.stderr, flush=True)
 
 
 def cmd_sync(client: BridgeClient, args: argparse.Namespace) -> int:
@@ -1714,6 +1822,8 @@ def cmd_capture(client: BridgeClient, args: argparse.Namespace) -> int:
     signal.signal(signal.SIGTERM, _handle_signal)
 
     try:
+        active = send_stream_start(client, args)
+        print(f"stream-control start ok: active={int(active)}")
         initial_mapping = sync_session.run_burst()
         if initial_mapping is not None:
             print(
@@ -1821,6 +1931,11 @@ def cmd_capture(client: BridgeClient, args: argparse.Namespace) -> int:
             f.write("]\n")
             f.flush()
     finally:
+        try:
+            active = send_stream_stop(client, args)
+            print(f"stream-control stop ok: active={int(active)}")
+        except Exception as exc:
+            print(f"stream-control stop warning: {exc}", file=sys.stderr, flush=True)
         client.set_imu_record_callback(None)
         client.set_sync_event_callback(None)
         sync_session.stop()
@@ -1841,11 +1956,41 @@ def build_parser() -> argparse.ArgumentParser:
         default=10.0,
         help="max print rate for imu_bundle/imu_diag (0 means print every frame)",
     )
+    parser.add_argument(
+        "--control-retries",
+        type=int,
+        default=5,
+        help="max attempts for reliable start/stop control commands",
+    )
+    parser.add_argument(
+        "--control-timeout-s",
+        type=float,
+        default=0.5,
+        help="timeout for one start/stop control attempt",
+    )
+    parser.add_argument(
+        "--control-retry-delay-s",
+        type=float,
+        default=0.05,
+        help="delay between start/stop control retries",
+    )
 
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     ping_parser = subparsers.add_parser("ping", help="send bridge ping")
     ping_parser.set_defaults(func=cmd_ping)
+
+    start_parser = subparsers.add_parser(
+        "start",
+        help="start YIS pose and TIM sync-event push after reliable ACK",
+    )
+    start_parser.set_defaults(func=cmd_start)
+
+    stop_parser = subparsers.add_parser(
+        "stop",
+        help="stop YIS pose and TIM sync-event push after reliable ACK",
+    )
+    stop_parser.set_defaults(func=cmd_stop)
 
     off_parser = subparsers.add_parser("off", help="turn off all WS2812 LEDs")
     off_parser.set_defaults(func=cmd_off)

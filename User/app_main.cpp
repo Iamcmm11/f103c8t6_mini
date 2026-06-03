@@ -91,6 +91,9 @@ void EnableTimUpdateInterrupt(void* context) {
     return;
   }
 
+  __HAL_TIM_DISABLE_IT(timer, TIM_IT_UPDATE);
+  __HAL_TIM_CLEAR_FLAG(timer, TIM_FLAG_UPDATE);
+  __HAL_TIM_SET_COUNTER(timer, 0U);
   __HAL_TIM_CLEAR_FLAG(timer, TIM_FLAG_UPDATE);
   __HAL_TIM_ENABLE_IT(timer, TIM_IT_UPDATE);
 }
@@ -210,45 +213,36 @@ extern "C" void app_main(void) {
   camera_trigger_output.context = &htim5;
   (void)sync_signal_manager.RegisterPwmOutput(camera_trigger_output);
 
-  const auto sync_start_ec = sync_signal_manager.StartAll();
-  (void)sync_start_ec;
-  const auto pwm_sync_ec = sync_signal_manager.GetLastStartResult(
-      ::Manager::SyncEventSource::TIM2_IMU_SYNC_1HZ);
-  const auto pwm_camera_ec = sync_signal_manager.GetLastStartResult(
-      ::Manager::SyncEventSource::TIM5_CAMERA_TRIGGER_30HZ);
-
-
-  const uint32_t tim5_clk_hz = GetTim5ClockHz();
-  const uint32_t tim5_psc = static_cast<uint32_t>(htim5.Init.Prescaler) + 1U;
-  const uint32_t tim5_arr = static_cast<uint32_t>(htim5.Init.Period) + 1U;
-  const uint32_t tim5_ccr = __HAL_TIM_GET_COMPARE(&htim5, TIM_CHANNEL_1);
+  const uint32_t tim_clk_hz = GetTim5ClockHz();
+  const uint32_t tim2_psc = static_cast<uint32_t>(htim2.Init.Prescaler) + 1U;
+  const uint32_t tim2_arr = static_cast<uint32_t>(htim2.Init.Period) + 1U;
+  const uint32_t tim2_ccr = __HAL_TIM_GET_COMPARE(&htim2, TIM_CHANNEL_3);
   const uint32_t sync_freq_hz =
-      (tim5_psc != 0U && tim5_arr != 0U) ? (tim5_clk_hz / tim5_psc / tim5_arr)
+      (tim2_psc != 0U && tim2_arr != 0U) ? (tim_clk_hz / tim2_psc / tim2_arr)
                                          : 0U;
 
   std::snprintf(
       line, sizeof(line),
-      "[boot] sync pwm ec=%d clk=%lu psc=%lu arr=%lu ccr=%lu freq=%lu",
-      static_cast<int>(pwm_sync_ec), static_cast<unsigned long>(tim5_clk_hz),
-      static_cast<unsigned long>(htim5.Init.Prescaler),
-      static_cast<unsigned long>(htim5.Init.Period),
-      static_cast<unsigned long>(tim5_ccr),
+      "[boot] sync pwm registered clk=%lu psc=%lu arr=%lu ccr=%lu freq=%lu",
+      static_cast<unsigned long>(tim_clk_hz),
+      static_cast<unsigned long>(htim2.Init.Prescaler),
+      static_cast<unsigned long>(htim2.Init.Period),
+      static_cast<unsigned long>(tim2_ccr),
       static_cast<unsigned long>(sync_freq_hz));
   Uart5PrintLine(line);
 
-  const uint32_t tim2_psc = static_cast<uint32_t>(htim2.Init.Prescaler) + 1U;
-  const uint32_t tim2_arr = static_cast<uint32_t>(htim2.Init.Period) + 1U;
-  const uint32_t tim2_ccr = __HAL_TIM_GET_COMPARE(&htim2, TIM_CHANNEL_3);
+  const uint32_t tim5_psc = static_cast<uint32_t>(htim5.Init.Prescaler) + 1U;
+  const uint32_t tim5_arr = static_cast<uint32_t>(htim5.Init.Period) + 1U;
+  const uint32_t tim5_ccr = __HAL_TIM_GET_COMPARE(&htim5, TIM_CHANNEL_1);
   const uint32_t camera_freq_hz =
-      (tim2_psc != 0U && tim2_arr != 0U) ? (tim5_clk_hz / tim2_psc / tim2_arr)
+      (tim5_psc != 0U && tim5_arr != 0U) ? (tim_clk_hz / tim5_psc / tim5_arr)
                                          : 0U;
 
   std::snprintf(line, sizeof(line),
-                "[boot] camera pwm ec=%d psc=%lu arr=%lu ccr=%lu freq=%lu",
-                static_cast<int>(pwm_camera_ec),
-                static_cast<unsigned long>(htim2.Init.Prescaler),
-                static_cast<unsigned long>(htim2.Init.Period),
-                static_cast<unsigned long>(tim2_ccr),
+                "[boot] camera pwm registered psc=%lu arr=%lu ccr=%lu freq=%lu",
+                static_cast<unsigned long>(htim5.Init.Prescaler),
+                static_cast<unsigned long>(htim5.Init.Period),
+                static_cast<unsigned long>(tim5_ccr),
                 static_cast<unsigned long>(camera_freq_hz));
   Uart5PrintLine(line);
 
@@ -276,16 +270,16 @@ extern "C" void app_main(void) {
   wit_acq_config.enabled_imu_count = 6;
 
   // YIS acquisition config: 200Hz, topic "yis_imu_pose",
-  // high priority, 1024-byte stack.
+  // high priority, 1536-byte stack.
   ::Application::YISIMUAcquisitionConfig yis_config;
   yis_config.frequency_hz = 200;
   yis_config.priority = static_cast<uint32_t>(LibXR::Thread::Priority::HIGH);
-  yis_config.stack_size = 1024;
+  yis_config.stack_size = 1536;
   yis_config.dr_wait_timeout_ms = 20;
   yis_config.topic_name = "yis_imu_pose";
   static ::Application::YISIMUAcquisitionTask yis_task(&yis_imu, yis_config, &PB8);
 
-  // Bridge config: 20ms push period, medium priority, 1024-byte stack.
+  // Bridge config: 20ms push period, medium priority, 1536-byte stack.
   // Select bridge pose source here: WIT or YIS.
   ::Application::IMUUartBridgeConfig bridge_config;
   bridge_config.stream_relative_euler = false;    //字符流输出
@@ -296,7 +290,7 @@ extern "C" void app_main(void) {
   bridge_config.wit_push_imu_count = wit_acq_config.enabled_imu_count;
   bridge_config.stream_interval_ms = 0;   //桥接推送频率不再设置为50hz或者200hz，根据底层数据输出频率决定，上层不加限制
   bridge_config.priority = static_cast<uint32_t>(LibXR::Thread::Priority::MEDIUM);
-  bridge_config.stack_size = 1024;
+  bridge_config.stack_size = 1536;
 
   // ========================================================================
   // Start Application threads  启动任务线程

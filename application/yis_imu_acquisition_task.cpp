@@ -164,6 +164,8 @@ void YISIMUAcquisitionTask::Run() {
     taskEXIT_CRITICAL();
     msg.readout_mcu_tick_us =
         (last_dr_mcu_tick_us != 0U) ? last_dr_mcu_tick_us : msg.timestamp_us;
+    msg.readout_mcu_tick_us =
+        Manager::SyncSignalManager::ToSessionTickUs(msg.readout_mcu_tick_us);
     msg.sensor_mcu_tick_us = 0U;
     msg.euler[0] = 0.0f;
     msg.euler[1] = 0.0f;
@@ -202,7 +204,8 @@ void YISIMUAcquisitionTask::Run() {
     }
     if (msg.status == 0U && sample_timestamp_ec == LibXR::ErrorCode::OK) {
       Manager::SyncEventRecord epoch;
-      if (Manager::SyncSignalManager::GetLatestEvent(
+      if (Manager::SyncSignalManager::IsActive() &&
+          Manager::SyncSignalManager::GetLatestEvent(
               Manager::SyncEventSource::TIM2_IMU_SYNC_1HZ, epoch)) {
         msg.time_status = static_cast<uint8_t>(msg.time_status |
                                                kYISTimeStatusHasEpoch);

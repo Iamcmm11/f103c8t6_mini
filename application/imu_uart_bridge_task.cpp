@@ -17,6 +17,7 @@ constexpr uint8_t kBridgeSof0 = 0x55;
 constexpr uint8_t kBridgeSof1 = 0xAA;
 constexpr uint8_t kBridgeCmdPing = 0x01;
 constexpr uint8_t kBridgeCmdTimeSync = 0x02;
+constexpr uint8_t kBridgeCmdStreamControl = 0x03;
 constexpr uint8_t kBridgeCmdI2CRead = 0x10;
 constexpr uint8_t kBridgeCmdI2CWrite = 0x11;
 constexpr uint8_t kBridgeCmdSPIWrite = 0x20;
@@ -63,6 +64,9 @@ constexpr uint16_t kBridgeSyncEventMaxPayload = static_cast<uint16_t>(
     sizeof(uint8_t) + kBridgeSyncEventMaxRecords * kBridgeSyncEventRecordSize);
 constexpr uint8_t kBridgeStatusOk = 0;
 constexpr uint8_t kBridgeStatusError = 1;
+constexpr uint8_t kBridgeStreamControlSeqSize = sizeof(uint32_t);
+constexpr uint8_t kBridgeStreamControlRespPayloadSize =
+    static_cast<uint8_t>(sizeof(uint8_t) + sizeof(uint32_t) + sizeof(uint8_t));
 constexpr uint8_t kMaxRegisterCount = 32;
 constexpr uint16_t kBridgeWITMaxPayload = static_cast<uint16_t>(
     kBridgeWITCompactHeaderSize +
@@ -76,9 +80,13 @@ constexpr uint16_t kBridgeNonSyncMaxPayload =
     (kBridgePoseMaxPayload > kBridgeTimeSyncRespPayloadSize)
         ? kBridgePoseMaxPayload
         : kBridgeTimeSyncRespPayloadSize;
-constexpr uint16_t kBridgeMaxResponsePayload =
-    (kBridgeNonSyncMaxPayload > kBridgeSyncEventMaxPayload)
+constexpr uint16_t kBridgeControlMaxPayload =
+    (kBridgeNonSyncMaxPayload > kBridgeStreamControlRespPayloadSize)
         ? kBridgeNonSyncMaxPayload
+        : kBridgeStreamControlRespPayloadSize;
+constexpr uint16_t kBridgeMaxResponsePayload =
+    (kBridgeControlMaxPayload > kBridgeSyncEventMaxPayload)
+        ? kBridgeControlMaxPayload
         : kBridgeSyncEventMaxPayload;
 constexpr uint32_t kBridgeWriteRetryCount = 3;
 constexpr uint32_t kBridgeWriteRetryDelayMs = 1;
@@ -139,6 +147,7 @@ IMUUartBridgeTask::IMUUartBridgeTask(UART* uart, I2C* i2c, SPI* spi,
       config_(config),
       running_(false),
       last_pose_push_ms_(0),
+      streaming_enabled_(false),
       thread_(nullptr),
       wit_subscriber_(nullptr),
       yis_queue_(nullptr),
@@ -175,6 +184,7 @@ void IMUUartBridgeTask::Stop() {
   if (!running_) {
     return;
   }
+  (void)SetStreamingEnabled(false);
   running_ = false;
   Thread::Sleep(config_.read_timeout_ms + 10);
 }
@@ -266,10 +276,15 @@ void IMUUartBridgeTask::RunBridgeMode() {
 
   while (running_) {
     (void)ProcessPendingCommand();
-    const PublishResult pose_result = PublishBridgePoseData();
-    if (config_.push_sync_events_in_bridge &&
-        pose_result != PublishResult::BACKPRESSURE) {
-      PublishSyncEvents();
+    if (streaming_enabled_) {
+      const PublishResult pose_result = PublishBridgePoseData();
+      if (config_.push_sync_events_in_bridge &&
+          pose_result != PublishResult::BACKPRESSURE) {
+        PublishSyncEvents();
+      }
+    } else {
+      ClearPendingPushData();
+      Thread::Sleep(1);
     }
   }
 
@@ -375,7 +390,7 @@ void IMUUartBridgeTask::ProcessCommandByte(uint8_t byte) {
 }
 
 IMUUartBridgeTask::PublishResult IMUUartBridgeTask::PublishBridgePoseData() {
-  if (!config_.push_imu_euler_in_bridge) {
+  if (!streaming_enabled_ || !config_.push_imu_euler_in_bridge) {
     return PublishResult::NONE;
   }
 
@@ -403,7 +418,8 @@ IMUUartBridgeTask::PublishResult IMUUartBridgeTask::PublishBridgePoseData() {
           !imu_msg.IsValid(imu_index)) {
         continue;
       }
-      base_tick_us = imu_msg.imu_data[imu_index].mcu_tick_us;
+      base_tick_us = Manager::SyncSignalManager::ToSessionTickUs(
+          imu_msg.imu_data[imu_index].mcu_tick_us);
       break;
     }
     std::memcpy(payload.data() + 1, &base_tick_us, sizeof(base_tick_us));
@@ -423,8 +439,10 @@ IMUUartBridgeTask::PublishResult IMUUartBridgeTask::PublishBridgePoseData() {
           Manager::ResolveImuI2CAddress(imu_index, config_.imu_addr);
       uint16_t cursor = static_cast<uint16_t>(base + 1);
       const auto& imu = imu_msg.imu_data[imu_index];
+      const uint64_t imu_tick_us =
+          Manager::SyncSignalManager::ToSessionTickUs(imu.mcu_tick_us);
       const uint16_t tick_delta_us =
-          valid ? TickDeltaUs(base_tick_us, imu.mcu_tick_us) : 0U;
+          valid ? TickDeltaUs(base_tick_us, imu_tick_us) : 0U;
       std::memcpy(payload.data() + cursor, &tick_delta_us,
                   sizeof(tick_delta_us));
       cursor = static_cast<uint16_t>(cursor + sizeof(tick_delta_us));
@@ -520,6 +538,11 @@ IMUUartBridgeTask::PublishResult IMUUartBridgeTask::PublishBridgePoseData() {
 }
 
 void IMUUartBridgeTask::PublishSyncEvents() {
+  if (!streaming_enabled_) {
+    pending_sync_event_count_ = 0U;
+    return;
+  }
+
   std::array<uint8_t, kBridgeSyncEventMaxPayload> payload{};
   uint16_t cursor = 1;
 
@@ -560,6 +583,52 @@ void IMUUartBridgeTask::PublishSyncEvents() {
   if (SendResponse(kBridgeCmdSyncEventPush, payload.data(), cursor)) {
     pending_sync_event_count_ = 0U;
   }
+}
+
+bool IMUUartBridgeTask::SetStreamingEnabled(bool enable) {
+  if (enable == streaming_enabled_) {
+    return true;
+  }
+
+  if (enable) {
+    ClearPendingPushData();
+    pending_sync_event_count_ = 0U;
+    const LibXR::ErrorCode ec =
+        Manager::SyncSignalManager::StartRegisteredOutputs();
+    if (ec != LibXR::ErrorCode::OK) {
+      return false;
+    }
+    ClearPendingPoseData();
+    last_pose_push_ms_ = Thread::GetTime();
+    streaming_enabled_ = true;
+    return true;
+  }
+
+  streaming_enabled_ = false;
+  const LibXR::ErrorCode ec =
+      Manager::SyncSignalManager::StopRegisteredOutputs();
+  ClearPendingPushData();
+  pending_sync_event_count_ = 0U;
+  return ec == LibXR::ErrorCode::OK;
+}
+
+void IMUUartBridgeTask::ClearPendingPushData() {
+  ClearPendingPoseData();
+  Manager::SyncEventRecord sync_event;
+  while (Manager::SyncSignalManager::PopEvent(sync_event)) {
+  }
+}
+
+void IMUUartBridgeTask::ClearPendingPoseData() {
+  if (wit_subscriber_ != nullptr && wit_subscriber_->Available()) {
+    wit_subscriber_->StartWaiting();
+  }
+  if (yis_queue_ != nullptr) {
+    Manager::YISPoseMsg yis_msg;
+    while (yis_queue_->Pop(yis_msg) == ErrorCode::OK) {
+    }
+  }
+  has_latest_yis_pose_ = false;
 }
 
 bool IMUUartBridgeTask::WriteString(const char* str) {
@@ -635,6 +704,9 @@ void IMUUartBridgeTask::HandleCommandFrame(uint8_t cmd, const uint8_t* payload,
     case kBridgeCmdTimeSync:
       HandleTimeSync(cmd, payload, payload_len);
       return;
+    case kBridgeCmdStreamControl:
+      HandleStreamControl(cmd, payload, payload_len);
+      return;
     case kBridgeCmdI2CRead:
       HandleI2CRead(cmd, payload, payload_len);
       return;
@@ -678,17 +750,66 @@ void IMUUartBridgeTask::HandleTimeSync(uint8_t cmd, const uint8_t* payload,
   std::memcpy(&seq, payload, sizeof(seq));
   const uint64_t t2_mcu_tick_us = Timebase::GetMicroseconds();
   const uint64_t t3_mcu_tick_us = Timebase::GetMicroseconds();
+  const uint64_t t2_session_tick_us =
+      Manager::SyncSignalManager::ToSessionTickUs(t2_mcu_tick_us);
+  const uint64_t t3_session_tick_us =
+      Manager::SyncSignalManager::ToSessionTickUs(t3_mcu_tick_us);
 
   std::array<uint8_t, kBridgeTimeSyncRespPayloadSize> resp{};
   resp[0] = kBridgeStatusOk;
   uint16_t cursor = 1;
   std::memcpy(resp.data() + cursor, &seq, sizeof(seq));
   cursor = static_cast<uint16_t>(cursor + sizeof(seq));
-  std::memcpy(resp.data() + cursor, &t2_mcu_tick_us, sizeof(t2_mcu_tick_us));
-  cursor = static_cast<uint16_t>(cursor + sizeof(t2_mcu_tick_us));
-  std::memcpy(resp.data() + cursor, &t3_mcu_tick_us, sizeof(t3_mcu_tick_us));
-  cursor = static_cast<uint16_t>(cursor + sizeof(t3_mcu_tick_us));
+  std::memcpy(resp.data() + cursor, &t2_session_tick_us,
+              sizeof(t2_session_tick_us));
+  cursor = static_cast<uint16_t>(cursor + sizeof(t2_session_tick_us));
+  std::memcpy(resp.data() + cursor, &t3_session_tick_us,
+              sizeof(t3_session_tick_us));
+  cursor = static_cast<uint16_t>(cursor + sizeof(t3_session_tick_us));
   (void)SendResponse(cmd, resp.data(), cursor);
+}
+
+void IMUUartBridgeTask::HandleStreamControl(uint8_t cmd,
+                                            const uint8_t* payload,
+                                            uint16_t payload_len) {
+  uint8_t resp_status = kBridgeStatusError;
+  uint32_t request_id = 0U;
+  bool command_valid = false;
+  bool enable = false;
+
+  if (payload != nullptr &&
+      payload_len >= kBridgeStreamControlSeqSize + 4U) {
+    std::memcpy(&request_id, payload, sizeof(request_id));
+    const char* action =
+        reinterpret_cast<const char*>(payload + kBridgeStreamControlSeqSize);
+    const uint16_t action_len =
+        static_cast<uint16_t>(payload_len - kBridgeStreamControlSeqSize);
+    if (action_len == 5U && std::memcmp(action, "start", 5U) == 0) {
+      command_valid = true;
+      enable = true;
+    } else if (action_len == 4U && std::memcmp(action, "stop", 4U) == 0) {
+      command_valid = true;
+      enable = false;
+    }
+  } else if (payload != nullptr && payload_len == 5U &&
+             std::memcmp(payload, "start", 5U) == 0) {
+    command_valid = true;
+    enable = true;
+  } else if (payload != nullptr && payload_len == 4U &&
+             std::memcmp(payload, "stop", 4U) == 0) {
+    command_valid = true;
+    enable = false;
+  }
+
+  if (command_valid && SetStreamingEnabled(enable)) {
+    resp_status = kBridgeStatusOk;
+  }
+
+  std::array<uint8_t, kBridgeStreamControlRespPayloadSize> resp{};
+  resp[0] = resp_status;
+  std::memcpy(resp.data() + 1, &request_id, sizeof(request_id));
+  resp[1 + sizeof(request_id)] = streaming_enabled_ ? 1U : 0U;
+  (void)SendResponse(cmd, resp.data(), resp.size());
 }
 
 void IMUUartBridgeTask::HandleI2CRead(uint8_t cmd, const uint8_t* payload,
