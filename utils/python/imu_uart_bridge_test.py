@@ -76,6 +76,7 @@ CMD_WS2812_CONTROL = 0x21
 CMD_IMU_EULER_PUSH = 0x30
 CMD_IMU_DIAG_PUSH = 0x31
 CMD_SYNC_EVENT_PUSH = 0x32
+CMD_GPIO_BUTTON_PUSH = 0x33
 
 STATUS_OK = 0
 DEFAULT_LED_COUNT = 21
@@ -165,6 +166,11 @@ class SyncEventRecord:
     mcu_tick_us: int
     nominal_period_us: int
     dropped_count: int
+
+
+@dataclass(frozen=True)
+class GPIOButtonEvent:
+    command: str
 
 
 @dataclass
@@ -757,6 +763,9 @@ class BridgeClient:
         sync_event_callback: Optional[
             Callable[[int, list[SyncEventRecord], RXMetadata], None]
         ] = None,
+        gpio_button_callback: Optional[
+            Callable[[int, GPIOButtonEvent, RXMetadata], None]
+        ] = None,
     ) -> None:
         self._port = port
         self._baud = baud
@@ -767,6 +776,7 @@ class BridgeClient:
         )
         self._imu_record_callback = imu_record_callback
         self._sync_event_callback = sync_event_callback
+        self._gpio_button_callback = gpio_button_callback
         self._serial: Optional[Serial] = None
         self._stop_event = threading.Event()
         self._rx_thread: Optional[threading.Thread] = None
@@ -797,6 +807,14 @@ class BridgeClient:
         ],
     ) -> None:
         self._sync_event_callback = callback
+
+    def set_gpio_button_callback(
+        self,
+        callback: Optional[
+            Callable[[int, GPIOButtonEvent, RXMetadata], None]
+        ],
+    ) -> None:
+        self._gpio_button_callback = callback
 
     def __enter__(self) -> "BridgeClient":
         self.open()
@@ -1022,6 +1040,9 @@ class BridgeClient:
             return
         if cmd == CMD_SYNC_EVENT_PUSH:
             self._handle_sync_event_push(payload, rx_meta)
+            return
+        if cmd == CMD_GPIO_BUTTON_PUSH:
+            self._handle_gpio_button_push(payload, rx_meta)
             return
 
         resp_queue = self._response_queues.setdefault(cmd, queue.Queue())
@@ -1426,6 +1447,46 @@ class BridgeClient:
                     f"flags,0x{event.flags:02X}",
                     flush=True,
                 )
+
+    def _parse_gpio_button_push(self, payload: bytes) -> Optional[GPIOButtonEvent]:
+        if len(payload) != 1:
+            return None
+        try:
+            command = payload.decode("ascii")
+        except UnicodeDecodeError:
+            return None
+        return GPIOButtonEvent(command=command)
+
+    def _handle_gpio_button_push(self, payload: bytes, rx_meta: RXMetadata) -> None:
+        event = self._parse_gpio_button_push(payload)
+        if event is None:
+            print(
+                f"[bridge] invalid GPIO button payload: {payload.hex(' ')}",
+                file=sys.stderr,
+                flush=True,
+            )
+            return
+
+        callback = self._gpio_button_callback
+        if callback is not None:
+            ts_unix_ms = rx_meta.rx_wall_us // 1000
+            try:
+                callback(ts_unix_ms, event, rx_meta)
+            except Exception as exc:
+                print(
+                    f"[bridge] gpio button callback error: {exc}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+
+        if self._print_imu:
+            self._end_imu_single_line()
+            print(
+                "gpio_button,"
+                f"command,{event.command},"
+                f"rx_timestamp_us,{rx_meta.rx_wall_us}",
+                flush=True,
+            )
 
 
 def send_ping(client: BridgeClient) -> None:
@@ -1855,6 +1916,10 @@ def cmd_capture(client: BridgeClient, args: argparse.Namespace) -> int:
     event_output_dir = os.path.dirname(event_output_path)
     if event_output_dir:
         os.makedirs(event_output_dir, exist_ok=True)
+    gpio_output_path = os.path.abspath(args.gpio_output)
+    gpio_output_dir = os.path.dirname(gpio_output_path)
+    if gpio_output_dir:
+        os.makedirs(gpio_output_dir, exist_ok=True)
     sync_path = os.path.abspath(args.sync_output)
     sync_mapper = TimeSyncMapper()
     sync_session = TimeSyncSession(
@@ -1902,7 +1967,9 @@ def cmd_capture(client: BridgeClient, args: argparse.Namespace) -> int:
             print("time-sync periodic disabled: using initial mapping only")
         with open(output_path, "w", encoding="utf-8", buffering=1) as f, open(
             event_output_path, "w", encoding="utf-8", newline="", buffering=1
-        ) as event_file:
+        ) as event_file, open(
+            gpio_output_path, "w", encoding="utf-8", newline="", buffering=1
+        ) as gpio_file:
             event_writer = csv.writer(event_file)
             event_writer.writerow(
                 [
@@ -1918,6 +1985,8 @@ def cmd_capture(client: BridgeClient, args: argparse.Namespace) -> int:
                     "sync_version",
                 ]
             )
+            gpio_writer = csv.writer(gpio_file)
+            gpio_writer.writerow(["command", "rx_timestamp_us", "timestamp_us"])
             f.write("[\n")
             first_row = True
 
@@ -1974,12 +2043,23 @@ def cmd_capture(client: BridgeClient, args: argparse.Namespace) -> int:
                     )
                 event_file.flush()
 
+            def _gpio_button(
+                _ts_unix_ms: int,
+                event: GPIOButtonEvent,
+                rx_meta: RXMetadata,
+            ) -> None:
+                timestamp_us = rx_meta.rx_wall_us
+                gpio_writer.writerow([event.command, rx_meta.rx_wall_us, timestamp_us])
+                gpio_file.flush()
+
             client.set_imu_record_callback(_record)
             client.set_sync_event_callback(_sync_event)
+            client.set_gpio_button_callback(_gpio_button)
             while not stop_event.is_set():
                 time.sleep(0.2)
             client.set_imu_record_callback(None)
             client.set_sync_event_callback(None)
+            client.set_gpio_button_callback(None)
             if not first_row:
                 f.write("\n")
             f.write("]\n")
@@ -1992,6 +2072,7 @@ def cmd_capture(client: BridgeClient, args: argparse.Namespace) -> int:
             print(f"stream-control stop warning: {exc}", file=sys.stderr, flush=True)
         client.set_imu_record_callback(None)
         client.set_sync_event_callback(None)
+        client.set_gpio_button_callback(None)
         sync_session.stop()
         signal.signal(signal.SIGINT, old_sigint)
         signal.signal(signal.SIGTERM, old_sigterm)
@@ -2145,6 +2226,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--event-output",
         default="log/sync_events.csv",
         help="output CSV path for TIM2/TIM5 sync event samples",
+    )
+    capture_parser.add_argument(
+        "--gpio-output",
+        default="log/gpio_button_events.csv",
+        help="output CSV path for GPIO button bridge events",
     )
     capture_parser.add_argument(
         "--sync-interval-s",

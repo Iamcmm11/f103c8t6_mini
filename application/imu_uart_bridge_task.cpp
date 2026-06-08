@@ -24,6 +24,7 @@ constexpr uint8_t kBridgeCmdSPIWrite = 0x20;
 constexpr uint8_t kBridgeCmdWS2812Control = 0x21;
 constexpr uint8_t kBridgeCmdPosePush = 0x30;
 constexpr uint8_t kBridgeCmdSyncEventPush = 0x32;
+constexpr uint8_t kBridgeCmdGPIOButtonPush = 0x33;
 
 constexpr std::array<uint8_t, Manager::ACTUAL_IMU_COUNT> kBridgeIMUPushIndexes = {
     static_cast<uint8_t>(Manager::ImuSlot::Forearm),
@@ -151,7 +152,8 @@ IMUUartBridgeTask::IMUUartBridgeTask(UART* uart, I2C* i2c, SPI* spi,
       thread_(nullptr),
       wit_subscriber_(nullptr),
       yis_queue_(nullptr),
-      yis_queue_subscriber_(nullptr) {}
+      yis_queue_subscriber_(nullptr),
+      gpio_button_queue_(8) {}
 
 ErrorCode IMUUartBridgeTask::Start() {
   if (running_) {
@@ -187,6 +189,40 @@ void IMUUartBridgeTask::Stop() {
   (void)SetStreamingEnabled(false);
   running_ = false;
   Thread::Sleep(config_.read_timeout_ms + 10);
+}
+
+bool IMUUartBridgeTask::PublishGPIOButtonCommand(char command) {
+  const auto ec = gpio_button_queue_.Push(static_cast<uint8_t>(command));
+  if (ec == ErrorCode::OK) {
+    ++gpio_button_queue_push_ok_;
+    LogGPIOButtonDiagEvent("queue_push_ok", command, gpio_button_queue_.Size());
+    return true;
+  }
+
+  ++gpio_button_queue_push_full_;
+  ++gpio_button_dropped_before_queue_;
+  LogGPIOButtonDiagEvent("queue_push_full", command, gpio_button_queue_.Size());
+  return false;
+}
+
+IMUUartBridgeGPIOButtonDiagStats IMUUartBridgeTask::GetGPIOButtonDiagStats() const {
+  IMUUartBridgeGPIOButtonDiagStats stats;
+  stats.queue_push_ok = gpio_button_queue_push_ok_;
+  stats.queue_push_full = gpio_button_queue_push_full_;
+  stats.queue_pop_ok = gpio_button_queue_pop_ok_;
+  stats.send_ok = gpio_button_send_ok_;
+  stats.send_fail = gpio_button_send_fail_;
+  stats.dropped_before_queue = gpio_button_dropped_before_queue_;
+  stats.pending_command = pending_gpio_button_command_;
+  stats.last_sent_command = gpio_button_last_sent_command_;
+  stats.has_pending = has_pending_gpio_button_command_;
+  return stats;
+}
+
+bool IMUUartBridgeTask::PublishGPIOButtonCommandCallback(void* context,
+                                                         char command) {
+  auto* bridge = static_cast<IMUUartBridgeTask*>(context);
+  return bridge != nullptr && bridge->PublishGPIOButtonCommand(command);
 }
 
 void IMUUartBridgeTask::TaskEntry(IMUUartBridgeTask* arg) {
@@ -275,12 +311,23 @@ void IMUUartBridgeTask::RunBridgeMode() {
   }
 
   while (running_) {
-    (void)ProcessPendingCommand();
+    bool did_work = ProcessPendingCommand();
+    const PublishResult gpio_result = PublishPendingGPIOButtonCommand();
+    did_work = did_work || (gpio_result == PublishResult::SENT);
+
     if (streaming_enabled_) {
       const PublishResult pose_result = PublishBridgePoseData();
+      did_work = did_work || (pose_result == PublishResult::SENT);
       if (config_.push_sync_events_in_bridge &&
           pose_result != PublishResult::BACKPRESSURE) {
+        const uint8_t sync_count_before = pending_sync_event_count_;
         PublishSyncEvents();
+        did_work = did_work || (sync_count_before != 0U &&
+                                pending_sync_event_count_ == 0U);
+      }
+      if (!did_work || gpio_result == PublishResult::BACKPRESSURE ||
+          pose_result == PublishResult::BACKPRESSURE) {
+        Thread::Sleep(1);
       }
     } else {
       ClearPendingPushData();
@@ -294,6 +341,36 @@ void IMUUartBridgeTask::RunBridgeMode() {
   yis_queue_subscriber_ = nullptr;
   delete yis_queue_;
   yis_queue_ = nullptr;
+}
+
+IMUUartBridgeTask::PublishResult IMUUartBridgeTask::PublishPendingGPIOButtonCommand() {
+  if (!has_pending_gpio_button_command_) {
+    if (gpio_button_queue_.Pop(pending_gpio_button_command_) != ErrorCode::OK) {
+      return PublishResult::NONE;
+    }
+    ++gpio_button_queue_pop_ok_;
+    has_pending_gpio_button_command_ = true;
+    LogGPIOButtonDiagEvent("queue_pop_ok",
+                           static_cast<char>(pending_gpio_button_command_),
+                           gpio_button_queue_.Size());
+  }
+
+  if (SendResponse(kBridgeCmdGPIOButtonPush, &pending_gpio_button_command_,
+                   sizeof(pending_gpio_button_command_))) {
+    ++gpio_button_send_ok_;
+    gpio_button_last_sent_command_ = pending_gpio_button_command_;
+    LogGPIOButtonDiagEvent("send_ok",
+                           static_cast<char>(pending_gpio_button_command_),
+                           gpio_button_queue_.Size());
+    has_pending_gpio_button_command_ = false;
+    return PublishResult::SENT;
+  } else {
+    ++gpio_button_send_fail_;
+    LogGPIOButtonDiagEvent("send_fail",
+                           static_cast<char>(pending_gpio_button_command_),
+                           gpio_button_queue_.Size());
+    return PublishResult::BACKPRESSURE;
+  }
 }
 
 bool IMUUartBridgeTask::ProcessPendingCommand() {
@@ -637,6 +714,28 @@ void IMUUartBridgeTask::ClearPendingPoseData() {
     }
   }
   has_latest_yis_pose_ = false;
+}
+
+void IMUUartBridgeTask::LogGPIOButtonDiagEvent(const char* stage, char command,
+                                               uint32_t value) const {
+  if (config_.log_writer == nullptr) {
+    return;
+  }
+
+  char line[128] = {0};
+  std::snprintf(line, sizeof(line),
+                "[gpio-diag] stage=%s cmd=%c q=%lu push_ok=%lu push_full=%lu "
+                "pop_ok=%lu send_ok=%lu send_fail=%lu pending=%u",
+                (stage != nullptr) ? stage : "null",
+                (command >= 32 && command <= 126) ? command : '?',
+                static_cast<unsigned long>(value),
+                static_cast<unsigned long>(gpio_button_queue_push_ok_),
+                static_cast<unsigned long>(gpio_button_queue_push_full_),
+                static_cast<unsigned long>(gpio_button_queue_pop_ok_),
+                static_cast<unsigned long>(gpio_button_send_ok_),
+                static_cast<unsigned long>(gpio_button_send_fail_),
+                static_cast<unsigned>(has_pending_gpio_button_command_ ? 1U : 0U));
+  config_.log_writer(line);
 }
 
 bool IMUUartBridgeTask::WriteString(const char* str) {

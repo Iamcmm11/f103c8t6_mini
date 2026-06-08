@@ -27,6 +27,7 @@ using namespace LibXR;
 
 #include "application/imu_uart_bridge_task.hpp"
 #include "application/yis_imu_acquisition_task.hpp"
+#include "managers/gpio_manager.hpp"
 #include "managers/imu_manager.hpp"
 #include "managers/sync_signal_manager.hpp"
 #include "managers/ws2812_manager.hpp"
@@ -146,8 +147,7 @@ extern "C" void app_main(void) {
 
   STM32SPI spi1(&hspi1, {nullptr, 0}, spi1_tx_buf, 3);
 
-  // STM32UART uart5(&huart5,
-  //             {nullptr, 0}, {nullptr, 0}, 5);
+  // UART5 has no DMA in CubeMX; keep it for blocking boot logs only.
 
   STM32UART usart1(&huart1,
               usart1_rx_buf, usart1_tx_buf, 5);
@@ -161,6 +161,15 @@ extern "C" void app_main(void) {
   /* User Code Begin 3 */
   char line[128] = {0};
 
+  (void)PA15.SetConfig(
+      {LibXR::GPIO::Direction::INPUT, LibXR::GPIO::Pull::UP});
+  (void)PB3.SetConfig(
+      {LibXR::GPIO::Direction::INPUT, LibXR::GPIO::Pull::UP});
+  (void)PB4.SetConfig(
+      {LibXR::GPIO::Direction::INPUT, LibXR::GPIO::Pull::UP});
+  (void)PC10.SetConfig(
+      {LibXR::GPIO::Direction::INPUT, LibXR::GPIO::Pull::UP});
+
   // ========================================================================
   // Create Manager / Module instances  创建设备管理
   // ========================================================================
@@ -169,6 +178,7 @@ extern "C" void app_main(void) {
   static ::Module::WS2812Strip ws2812_strip(&spi1);
   static ::Manager::WS2812Manager ws2812_manager;
   static ::Manager::IMUManager imu_manager(::Manager::ACTUAL_IMU_COUNT);
+  static ::Manager::GPIOManager gpio_manager;
   static ::Manager::SyncSignalManager sync_signal_manager;
   static ::Module::YISIMU yis_imu(&i2c1, yis_i2c_addr);
 
@@ -291,6 +301,25 @@ extern "C" void app_main(void) {
   bridge_config.stream_interval_ms = 0;   //桥接推送频率不再设置为50hz或者200hz，根据底层数据输出频率决定，上层不加限制
   bridge_config.priority = static_cast<uint32_t>(LibXR::Thread::Priority::MEDIUM);
   bridge_config.stack_size = 1536;
+  bridge_config.log_writer = Uart5PrintLine;
+  static ::Application::IMUUartBridgeTask imu_bridge(
+      &usart1, &i2c1, &spi1, &imu_manager, &ws2812_manager, bridge_config);
+
+  const ::Manager::GPIOButtonCommand button_commands[] = {
+      {&PC10, 'A'},
+      {&PA15, 'B'},
+      {&PB3, 'C'},
+      {&PB4, 'D'},
+  };
+  ::Manager::GPIOManagerConfig gpio_config;
+  gpio_config.command_callback =
+      ::Application::IMUUartBridgeTask::PublishGPIOButtonCommandCallback;
+  gpio_config.command_context = &imu_bridge;
+  gpio_config.commands = button_commands;
+  gpio_config.command_count =
+      sizeof(button_commands) / sizeof(button_commands[0]);
+  gpio_config.stack_size = 1024;
+  const auto gpio_init_ec = gpio_manager.Init(gpio_config);
 
   // ========================================================================
   // Start Application threads  启动任务线程
@@ -310,10 +339,11 @@ extern "C" void app_main(void) {
   }
 
   // 启动串口桥收发任务
-  static ::Application::IMUUartBridgeTask imu_bridge(
-      &usart1, &i2c1, &spi1, &imu_manager, &ws2812_manager, bridge_config);
   const auto bridge_start_ec = imu_bridge.Start();
-  (void)bridge_start_ec;
+  const auto gpio_start_ec =
+      (gpio_init_ec == ErrorCode::OK && bridge_start_ec == ErrorCode::OK)
+          ? gpio_manager.Start()
+          : ((gpio_init_ec != ErrorCode::OK) ? gpio_init_ec : bridge_start_ec);
 
   std::snprintf(line, sizeof(line), "[boot] wit start=%d freq=%lu stack=%lu",
                 static_cast<int>(imu_acq_ec),
@@ -331,6 +361,12 @@ extern "C" void app_main(void) {
                 static_cast<int>(bridge_start_ec),
                 static_cast<unsigned>(bridge_config.push_imu_euler_in_bridge),
                 static_cast<unsigned long>(bridge_config.stream_interval_ms));
+  Uart5PrintLine(line);
+
+  std::snprintf(line, sizeof(line),
+                "[boot] gpio init=%d start=%d PC10=A PA15=B PB3=C PB4=D",
+                static_cast<int>(gpio_init_ec),
+                static_cast<int>(gpio_start_ec));
   Uart5PrintLine(line);
 
   // ========================================================================

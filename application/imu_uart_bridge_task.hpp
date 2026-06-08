@@ -5,6 +5,7 @@
 
 #include "i2c.hpp"
 #include "libxr_def.hpp"
+#include "lockfree_queue.hpp"
 #include "managers/imu_manager.hpp"
 #include "managers/sync_signal_manager.hpp"
 #include "message.hpp"
@@ -34,6 +35,19 @@ struct IMUUartBridgeConfig {
   uint32_t stream_interval_ms = 20;
   uint32_t priority = static_cast<uint32_t>(LibXR::Thread::Priority::MEDIUM);
   uint32_t stack_size = 768;
+  void (*log_writer)(const char* text) = nullptr;
+};
+
+struct IMUUartBridgeGPIOButtonDiagStats {
+  uint32_t queue_push_ok = 0;
+  uint32_t queue_push_full = 0;
+  uint32_t queue_pop_ok = 0;
+  uint32_t send_ok = 0;
+  uint32_t send_fail = 0;
+  uint32_t dropped_before_queue = 0;
+  uint8_t pending_command = 0;
+  uint8_t last_sent_command = 0;
+  bool has_pending = false;
 };
 
 class IMUUartBridgeTask {
@@ -46,6 +60,10 @@ class IMUUartBridgeTask {
 
   LibXR::ErrorCode Start();
   void Stop();
+  bool PublishGPIOButtonCommand(char command);
+  IMUUartBridgeGPIOButtonDiagStats GetGPIOButtonDiagStats() const;
+
+  static bool PublishGPIOButtonCommandCallback(void* context, char command);
 
  private:
   static void TaskEntry(IMUUartBridgeTask* arg);
@@ -67,6 +85,7 @@ class IMUUartBridgeTask {
   void Run();
   void RunStreamMode();
   void RunBridgeMode();
+  PublishResult PublishPendingGPIOButtonCommand();
   bool ProcessPendingCommand();
   void ProcessCommandByte(uint8_t byte);
   void ResetCommandParser();
@@ -75,6 +94,8 @@ class IMUUartBridgeTask {
   bool SetStreamingEnabled(bool enable);
   void ClearPendingPushData();
   void ClearPendingPoseData();
+  void LogGPIOButtonDiagEvent(const char* stage, char command,
+                              uint32_t value = 0) const;
   bool WriteString(const char* str);
   bool WriteExact(const uint8_t* buf, uint16_t len);
   bool WriteSPI(const uint8_t* buf, uint16_t len);
@@ -111,12 +132,22 @@ class IMUUartBridgeTask {
   LibXR::Topic::ASyncSubscriber<Manager::IMUArrayMsg>* wit_subscriber_;
   LibXR::LockFreeQueue<Manager::YISPoseMsg>* yis_queue_;
   LibXR::Topic::QueuedSubscriber* yis_queue_subscriber_;
+  LibXR::LockFreeQueue<uint8_t> gpio_button_queue_;
   CommandParserState command_parser_state_ = CommandParserState::WAIT_SOF0;
   std::array<uint8_t, kCommandPayloadBufferSize> command_payload_{};
   uint16_t command_payload_len_ = 0;
   uint16_t command_payload_pos_ = 0;
   uint8_t command_cmd_ = 0;
   uint8_t command_sum_ = 0;
+  uint8_t pending_gpio_button_command_ = 0;
+  bool has_pending_gpio_button_command_ = false;
+  volatile uint32_t gpio_button_queue_push_ok_ = 0;
+  volatile uint32_t gpio_button_queue_push_full_ = 0;
+  volatile uint32_t gpio_button_queue_pop_ok_ = 0;
+  volatile uint32_t gpio_button_send_ok_ = 0;
+  volatile uint32_t gpio_button_send_fail_ = 0;
+  volatile uint32_t gpio_button_dropped_before_queue_ = 0;
+  volatile uint8_t gpio_button_last_sent_command_ = 0;
   Manager::YISPoseMsg latest_yis_pose_{};
   bool has_latest_yis_pose_ = false;
   std::array<Manager::SyncEventRecord, 8> pending_sync_events_{};

@@ -27,7 +27,6 @@
 TIM_HandleTypeDef htim2;
 TIM_HandleTypeDef htim5;
 TIM_HandleTypeDef htim6;
-DMA_HandleTypeDef hdma_tim5_ch1;
 
 /* TIM2 init function */
 void MX_TIM2_Init(void)
@@ -192,23 +191,6 @@ void HAL_TIM_Base_MspInit(TIM_HandleTypeDef* tim_baseHandle)
     /* TIM5 clock enable */
     __HAL_RCC_TIM5_CLK_ENABLE();
 
-    /* TIM5 DMA Init */
-    /* TIM5_CH1 Init */
-    hdma_tim5_ch1.Instance = DMA2_Channel5;
-    hdma_tim5_ch1.Init.Direction = DMA_PERIPH_TO_MEMORY;
-    hdma_tim5_ch1.Init.PeriphInc = DMA_PINC_DISABLE;
-    hdma_tim5_ch1.Init.MemInc = DMA_MINC_ENABLE;
-    hdma_tim5_ch1.Init.PeriphDataAlignment = DMA_PDATAALIGN_HALFWORD;
-    hdma_tim5_ch1.Init.MemDataAlignment = DMA_MDATAALIGN_HALFWORD;
-    hdma_tim5_ch1.Init.Mode = DMA_NORMAL;
-    hdma_tim5_ch1.Init.Priority = DMA_PRIORITY_LOW;
-    if (HAL_DMA_Init(&hdma_tim5_ch1) != HAL_OK)
-    {
-      Error_Handler();
-    }
-
-    __HAL_LINKDMA(tim_baseHandle,hdma[TIM_DMA_ID_CC1],hdma_tim5_ch1);
-
     /* TIM5 interrupt Init */
     HAL_NVIC_SetPriority(TIM5_IRQn, 5, 0);
     HAL_NVIC_EnableIRQ(TIM5_IRQn);
@@ -305,9 +287,6 @@ void HAL_TIM_Base_MspDeInit(TIM_HandleTypeDef* tim_baseHandle)
   /* USER CODE END TIM5_MspDeInit 0 */
     /* Peripheral clock disable */
     __HAL_RCC_TIM5_CLK_DISABLE();
-
-    /* TIM5 DMA DeInit */
-    HAL_DMA_DeInit(tim_baseHandle->hdma[TIM_DMA_ID_CC1]);
 
     /* TIM5 interrupt Deinit */
     HAL_NVIC_DisableIRQ(TIM5_IRQn);
