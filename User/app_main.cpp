@@ -189,10 +189,26 @@ extern "C" void app_main(void) {
   constexpr uint16_t ws2812_led_count = 16;
   const auto ws2812_ec =
       ws2812_manager.Init(&ws2812_strip, 0, ws2812_led_count);
+  constexpr uint8_t ws2812_boot_red = 135;
+  constexpr uint8_t ws2812_boot_green = 206;
+  constexpr uint8_t ws2812_boot_blue = 250;
+  const auto ws2812_boot_ec =
+      (ws2812_ec == ErrorCode::OK)
+          ? ws2812_manager.SetLightControl(
+                ::Manager::WS2812Manager::kAllLedsTarget, ws2812_boot_red,
+                ws2812_boot_green, ws2812_boot_blue, false, 0U)
+          : ws2812_ec;
 
   std::snprintf(line, sizeof(line), "[boot] ws2812 ec=%d leds=%u",
                 static_cast<int>(ws2812_ec),
                 static_cast<unsigned>(ws2812_led_count));
+  Uart5PrintLine(line);
+  std::snprintf(line, sizeof(line),
+                "[boot] ws2812 default=%d rgb=(%u,%u,%u)",
+                static_cast<int>(ws2812_boot_ec),
+                static_cast<unsigned>(ws2812_boot_red),
+                static_cast<unsigned>(ws2812_boot_green),
+                static_cast<unsigned>(ws2812_boot_blue));
   Uart5PrintLine(line);
 
   const auto imu_init_ec =
@@ -301,7 +317,6 @@ extern "C" void app_main(void) {
   bridge_config.stream_interval_ms = 0;   //桥接推送频率不再设置为50hz或者200hz，根据底层数据输出频率决定，上层不加限制
   bridge_config.priority = static_cast<uint32_t>(LibXR::Thread::Priority::MEDIUM);
   bridge_config.stack_size = 1536;
-  bridge_config.log_writer = Uart5PrintLine;
   static ::Application::IMUUartBridgeTask imu_bridge(
       &usart1, &i2c1, &spi1, &imu_manager, &ws2812_manager, bridge_config);
 

@@ -192,31 +192,7 @@ void IMUUartBridgeTask::Stop() {
 }
 
 bool IMUUartBridgeTask::PublishGPIOButtonCommand(char command) {
-  const auto ec = gpio_button_queue_.Push(static_cast<uint8_t>(command));
-  if (ec == ErrorCode::OK) {
-    ++gpio_button_queue_push_ok_;
-    LogGPIOButtonDiagEvent("queue_push_ok", command, gpio_button_queue_.Size());
-    return true;
-  }
-
-  ++gpio_button_queue_push_full_;
-  ++gpio_button_dropped_before_queue_;
-  LogGPIOButtonDiagEvent("queue_push_full", command, gpio_button_queue_.Size());
-  return false;
-}
-
-IMUUartBridgeGPIOButtonDiagStats IMUUartBridgeTask::GetGPIOButtonDiagStats() const {
-  IMUUartBridgeGPIOButtonDiagStats stats;
-  stats.queue_push_ok = gpio_button_queue_push_ok_;
-  stats.queue_push_full = gpio_button_queue_push_full_;
-  stats.queue_pop_ok = gpio_button_queue_pop_ok_;
-  stats.send_ok = gpio_button_send_ok_;
-  stats.send_fail = gpio_button_send_fail_;
-  stats.dropped_before_queue = gpio_button_dropped_before_queue_;
-  stats.pending_command = pending_gpio_button_command_;
-  stats.last_sent_command = gpio_button_last_sent_command_;
-  stats.has_pending = has_pending_gpio_button_command_;
-  return stats;
+  return gpio_button_queue_.Push(static_cast<uint8_t>(command)) == ErrorCode::OK;
 }
 
 bool IMUUartBridgeTask::PublishGPIOButtonCommandCallback(void* context,
@@ -348,29 +324,16 @@ IMUUartBridgeTask::PublishResult IMUUartBridgeTask::PublishPendingGPIOButtonComm
     if (gpio_button_queue_.Pop(pending_gpio_button_command_) != ErrorCode::OK) {
       return PublishResult::NONE;
     }
-    ++gpio_button_queue_pop_ok_;
     has_pending_gpio_button_command_ = true;
-    LogGPIOButtonDiagEvent("queue_pop_ok",
-                           static_cast<char>(pending_gpio_button_command_),
-                           gpio_button_queue_.Size());
   }
 
   if (SendResponse(kBridgeCmdGPIOButtonPush, &pending_gpio_button_command_,
                    sizeof(pending_gpio_button_command_))) {
-    ++gpio_button_send_ok_;
-    gpio_button_last_sent_command_ = pending_gpio_button_command_;
-    LogGPIOButtonDiagEvent("send_ok",
-                           static_cast<char>(pending_gpio_button_command_),
-                           gpio_button_queue_.Size());
     has_pending_gpio_button_command_ = false;
     return PublishResult::SENT;
-  } else {
-    ++gpio_button_send_fail_;
-    LogGPIOButtonDiagEvent("send_fail",
-                           static_cast<char>(pending_gpio_button_command_),
-                           gpio_button_queue_.Size());
-    return PublishResult::BACKPRESSURE;
   }
+
+  return PublishResult::BACKPRESSURE;
 }
 
 bool IMUUartBridgeTask::ProcessPendingCommand() {
@@ -714,28 +677,6 @@ void IMUUartBridgeTask::ClearPendingPoseData() {
     }
   }
   has_latest_yis_pose_ = false;
-}
-
-void IMUUartBridgeTask::LogGPIOButtonDiagEvent(const char* stage, char command,
-                                               uint32_t value) const {
-  if (config_.log_writer == nullptr) {
-    return;
-  }
-
-  char line[128] = {0};
-  std::snprintf(line, sizeof(line),
-                "[gpio-diag] stage=%s cmd=%c q=%lu push_ok=%lu push_full=%lu "
-                "pop_ok=%lu send_ok=%lu send_fail=%lu pending=%u",
-                (stage != nullptr) ? stage : "null",
-                (command >= 32 && command <= 126) ? command : '?',
-                static_cast<unsigned long>(value),
-                static_cast<unsigned long>(gpio_button_queue_push_ok_),
-                static_cast<unsigned long>(gpio_button_queue_push_full_),
-                static_cast<unsigned long>(gpio_button_queue_pop_ok_),
-                static_cast<unsigned long>(gpio_button_send_ok_),
-                static_cast<unsigned long>(gpio_button_send_fail_),
-                static_cast<unsigned>(has_pending_gpio_button_command_ ? 1U : 0U));
-  config_.log_writer(line);
 }
 
 bool IMUUartBridgeTask::WriteString(const char* str) {
