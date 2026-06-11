@@ -11,23 +11,29 @@ Continuous IMU monitor:
   python3 /tmp/imu_uart_bridge_test.py --port /dev/ttyTCU0 console
   python utils/python/imu_uart_bridge_test.py --port COM4 console 
 Examples:
-  python3 /tmp/imu_uart_bridge_test.py --port /dev/ttyTCU0 ping
+  python3 scripts/imu_uart_bridge_test.py --port /dev/ttyTCU0 ping
   python3 /tmp/imu_uart_bridge_test.py --port /dev/ttyTCU0 rgb 135 206 250
   python3 /tmp/imu_uart_bridge_test.py --port /dev/ttyTCU0 led 3 255 0 0
   python3 /tmp/imu_uart_bridge_test.py --port /dev/ttyTCU0 off
   python3 /tmp/imu_uart_bridge_test.py --port /dev/ttyTCU0 blink 135 206 250
   python3 /tmp/imu_uart_bridge_test.py --port /dev/ttyTCU0 console
-"""
+""" 
 
 from __future__ import annotations
 
 import argparse
+import json
+import math
+import os
 import queue
+import signal
 import struct
 import sys
 import threading
 import time
-from typing import Optional
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Callable, Optional
 
 try:
     import serial
@@ -51,7 +57,49 @@ STATUS_OK = 0
 DEFAULT_SPI_BUS = 0
 DEFAULT_LED_COUNT = 16
 MAX_FRAME_PAYLOAD = 1024
-IMU_PUSH_RECORD_SIZE = 13
+IMU_PUSH_LEGACY_RECORD_SIZE = struct.calcsize("<Bfff")
+IMU_PUSH_QUAT_ONLY_FLOAT_COUNT = 4
+IMU_PUSH_QUAT_ONLY_RECORD_SIZE = struct.calcsize(
+    "<B" + ("f" * IMU_PUSH_QUAT_ONLY_FLOAT_COUNT)
+)
+IMU_PUSH_EXTENDED_FLOAT_COUNT = 13
+IMU_PUSH_EXTENDED_RECORD_SIZE = struct.calcsize(
+    "<B" + ("f" * IMU_PUSH_EXTENDED_FLOAT_COUNT)
+)
+# JSON 固定列顺序（按用户要求：0x50/0x51/0x52/0x53）
+DEFAULT_IMU_ADDR_COLUMNS = [0x50, 0x51, 0x52, 0x53]
+ANSI_RESET = "\033[0m"
+ANSI_CLEAR_LINE = "\033[2K"
+ANSI_ADDR_COLOR = {
+    0x50: "\033[91m",  # red
+    0x51: "\033[94m",  # blue
+    0x52: "\033[92m",  # green
+    0x53: "\033[93m",  # yellow
+}
+
+
+@dataclass(frozen=True)
+class IMUPushRecord:
+    imu_addr: int
+    roll_deg: float
+    pitch_deg: float
+    yaw_deg: float
+    acc_x: float = math.nan
+    acc_y: float = math.nan
+    acc_z: float = math.nan
+    gyro_x: float = math.nan
+    gyro_y: float = math.nan
+    gyro_z: float = math.nan
+    quat_w: float = math.nan
+    quat_x: float = math.nan
+    quat_y: float = math.nan
+    quat_z: float = math.nan
+
+    def has_extended_data(self) -> bool:
+        return not math.isnan(self.acc_x)
+
+    def has_quaternion_data(self) -> bool:
+        return not math.isnan(self.quat_w)
 
 
 def calc_sum(data: bytes) -> int:
@@ -99,6 +147,14 @@ def make_single_led_frame(
     return bytes(frame)
 
 
+def format_addr_with_color(addr: int) -> str:
+    text = f"0x{addr:02X}"
+    color = ANSI_ADDR_COLOR.get(addr)
+    if not color:
+        return text
+    return f"{color}{text}{ANSI_RESET}"
+
+
 class BridgeClient:
     def __init__(
         self,
@@ -108,6 +164,9 @@ class BridgeClient:
         *,
         print_imu: bool = True,
         imu_print_hz: float = 10.0,
+        imu_record_callback: Optional[
+            Callable[[int, list[IMUPushRecord]], None]
+        ] = None,
     ) -> None:
         self._port = port
         self._baud = baud
@@ -116,23 +175,27 @@ class BridgeClient:
         self._imu_print_interval_s = (
             0.0 if imu_print_hz <= 0.0 else 1.0 / imu_print_hz
         )
+        self._imu_record_callback = imu_record_callback
         self._serial: Optional[Serial] = None
         self._stop_event = threading.Event()
         self._rx_thread: Optional[threading.Thread] = None
         self._tx_lock = threading.Lock()
         self._request_lock = threading.Lock()
-        self._last_checksum_log_s = 0.0
-        self._checksum_drop_count = 0
         self._last_imu_print_s = 0.0
         self._last_diag_print_s = 0.0
         self._last_imu_line_len = 0
-        self._frame_ok_count = 0
-        self._frame_bad_count = 0
-        self._last_stats_print_s = 0.0
         self._response_queues = {
             CMD_PING: queue.Queue(),
             CMD_WS2812_FRAME: queue.Queue(),
         }
+
+    def set_imu_record_callback(
+        self,
+        callback: Optional[
+            Callable[[int, list[IMUPushRecord]], None]
+        ],
+    ) -> None:
+        self._imu_record_callback = callback
 
     def __enter__(self) -> "BridgeClient":
         self.open()
@@ -233,15 +296,12 @@ class BridgeClient:
                 if want <= 0:
                     # Non-blocking poll, avoid busy-spin.
                     time.sleep(0.001)
-                    self._print_rx_stats()
                     continue
                 chunk = self._serial.read(want)
                 if not chunk:
-                    self._print_rx_stats()
                     continue
                 rx_buf.extend(chunk)
                 self._process_rx_buffer(rx_buf)
-                self._print_rx_stats()
             except serial.SerialException:
                 return
             except Exception as exc:
@@ -278,39 +338,12 @@ class BridgeClient:
             checksum = rx_buf[5 + payload_len]
             expect = (calc_sum(header) + calc_sum(payload)) & 0xFF
             if checksum != expect:
-                self._frame_bad_count += 1
-                self._checksum_drop_count += 1
-                now = time.monotonic()
-                if now - self._last_checksum_log_s > 1.0:
-                    print(
-                        f"[bridge] checksum mismatch: rx=0x{checksum:02X}, expect=0x{expect:02X}, drops={self._checksum_drop_count}",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-                    self._last_checksum_log_s = now
-                    self._checksum_drop_count = 0
                 # Slide one byte instead of dropping the whole candidate frame.
                 del rx_buf[0]
                 continue
 
             del rx_buf[:total_len]
-            self._frame_ok_count += 1
             self._dispatch_frame(cmd, payload)
-
-    def _print_rx_stats(self) -> None:
-        now = time.monotonic()
-        if now - self._last_stats_print_s < 1.0:
-            return
-        total = self._frame_ok_count + self._frame_bad_count
-        if total > 0:
-            bad_pct = (self._frame_bad_count * 100.0) / total
-            print(
-                f"[bridge] rx stats: total={total}, ok={self._frame_ok_count}, bad={self._frame_bad_count}, bad_pct={bad_pct:.2f}%",
-                file=sys.stderr,
-            )
-        self._frame_ok_count = 0
-        self._frame_bad_count = 0
-        self._last_stats_print_s = now
 
     def _read_frame(self) -> Optional[tuple[int, bytes]]:
         if self._serial is None:
@@ -348,16 +381,6 @@ class BridgeClient:
             checksum = checksum_raw[0]
             expect = (calc_sum(header) + calc_sum(payload)) & 0xFF
             if checksum != expect:
-                self._checksum_drop_count += 1
-                now = time.monotonic()
-                if now - self._last_checksum_log_s > 1.0:
-                    print(
-                        f"[bridge] checksum mismatch: rx=0x{checksum:02X}, expect=0x{expect:02X}, drops={self._checksum_drop_count}",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-                    self._last_checksum_log_s = now
-                    self._checksum_drop_count = 0
                 continue
 
             return header[2], payload
@@ -385,6 +408,14 @@ class BridgeClient:
             )
             return
 
+        callback = self._imu_record_callback
+        if callback is not None and imu_records:
+            ts_unix_ms = int(time.time() * 1000)
+            try:
+                callback(ts_unix_ms, imu_records)
+            except Exception as exc:
+                print(f"[bridge] imu record callback error: {exc}", file=sys.stderr, flush=True)
+
         if self._print_imu and imu_records:
             now = time.monotonic()
             if (
@@ -393,26 +424,23 @@ class BridgeClient:
             ):
                 return
             self._last_imu_print_s = now
-            line = ",".join(
-                ["imu_bundle", str(len(imu_records))]
-                + [
-                    item
-                    for imu_addr, roll_deg, pitch_deg, yaw_deg in imu_records
-                    for item in (
-                        f"0x{imu_addr:02X}",
-                        f"{roll_deg:.3f}",
-                        f"{pitch_deg:.3f}",
-                        f"{yaw_deg:.3f}",
+            parts = ["imu_bundle", str(len(imu_records))]
+            for record in imu_records:
+                parts.append(format_addr_with_color(record.imu_addr))
+                if record.has_quaternion_data():
+                    parts.append(
+                        f"quat=({record.quat_w:.4f},{record.quat_x:.4f},{record.quat_y:.4f},{record.quat_z:.4f})"
                     )
-                ]
-            )
+                else:
+                    parts.append("quat=(NA)")
+            line = ",".join(parts)
             self._print_imu_single_line(line)
 
     def _print_imu_single_line(self, line: str) -> None:
         extra = self._last_imu_line_len - len(line)
         if extra > 0:
             line = line + (" " * extra)
-        sys.stdout.write("\r" + line)
+        sys.stdout.write("\r" + ANSI_CLEAR_LINE + line)
         sys.stdout.flush()
         self._last_imu_line_len = len(line)
 
@@ -424,27 +452,84 @@ class BridgeClient:
 
     def _parse_imu_push(
         self, payload: bytes
-    ) -> Optional[list[tuple[int, float, float, float]]]:
-        if len(payload) == IMU_PUSH_RECORD_SIZE:
-            return [struct.unpack("<Bfff", payload)]
+    ) -> Optional[list[IMUPushRecord]]:
+        if len(payload) == IMU_PUSH_LEGACY_RECORD_SIZE:
+            return [self._unpack_imu_record(payload)]
 
         if len(payload) < 1:
             return None
 
         imu_count = payload[0]
         records_raw = payload[1:]
-        if len(records_raw) != imu_count * IMU_PUSH_RECORD_SIZE:
+        if imu_count == 0:
+            return []
+        if len(records_raw) % imu_count != 0:
             return None
 
-        imu_records: list[tuple[int, float, float, float]] = []
-        for offset in range(0, len(records_raw), IMU_PUSH_RECORD_SIZE):
+        record_size = len(records_raw) // imu_count
+        if record_size not in (
+            IMU_PUSH_LEGACY_RECORD_SIZE,
+            IMU_PUSH_QUAT_ONLY_RECORD_SIZE,
+            IMU_PUSH_EXTENDED_RECORD_SIZE,
+        ):
+            return None
+
+        imu_records: list[IMUPushRecord] = []
+        for offset in range(0, len(records_raw), record_size):
             imu_records.append(
-                struct.unpack(
-                    "<Bfff",
-                    records_raw[offset : offset + IMU_PUSH_RECORD_SIZE],
-                )
+                self._unpack_imu_record(records_raw[offset : offset + record_size])
             )
         return imu_records
+
+    def _unpack_imu_record(self, payload: bytes) -> IMUPushRecord:
+        if len(payload) == IMU_PUSH_LEGACY_RECORD_SIZE:
+            imu_addr, roll_deg, pitch_deg, yaw_deg = struct.unpack("<Bfff", payload)
+            return IMUPushRecord(
+                imu_addr=imu_addr,
+                roll_deg=roll_deg,
+                pitch_deg=pitch_deg,
+                yaw_deg=yaw_deg,
+            )
+
+        if len(payload) == IMU_PUSH_QUAT_ONLY_RECORD_SIZE:
+            imu_addr, quat_w, quat_x, quat_y, quat_z = struct.unpack(
+                "<B" + ("f" * IMU_PUSH_QUAT_ONLY_FLOAT_COUNT),
+                payload,
+            )
+            return IMUPushRecord(
+                imu_addr=imu_addr,
+                roll_deg=math.nan,
+                pitch_deg=math.nan,
+                yaw_deg=math.nan,
+                quat_w=quat_w,
+                quat_x=quat_x,
+                quat_y=quat_y,
+                quat_z=quat_z,
+            )
+
+        if len(payload) == IMU_PUSH_EXTENDED_RECORD_SIZE:
+            values = struct.unpack(
+                "<B" + ("f" * IMU_PUSH_EXTENDED_FLOAT_COUNT),
+                payload,
+            )
+            return IMUPushRecord(
+                imu_addr=values[0],
+                roll_deg=values[1],
+                pitch_deg=values[2],
+                yaw_deg=values[3],
+                acc_x=values[4],
+                acc_y=values[5],
+                acc_z=values[6],
+                gyro_x=values[7],
+                gyro_y=values[8],
+                gyro_z=values[9],
+                quat_w=values[10],
+                quat_x=values[11],
+                quat_y=values[12],
+                quat_z=values[13],
+            )
+
+        raise ValueError(f"unsupported imu record size: {len(payload)}")
 
     def _handle_imu_diag_push(self, payload: bytes) -> None:
         if len(payload) != 11:
@@ -705,6 +790,98 @@ def cmd_monitor(client: BridgeClient, _args: argparse.Namespace) -> int:
         return 0
 
 
+def cmd_capture(client: BridgeClient, args: argparse.Namespace) -> int:
+    output_path = os.path.abspath(args.output)
+    output_dir = os.path.dirname(output_path)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+
+    stop_event = threading.Event()
+
+    def _handle_signal(_signum, _frame):
+        stop_event.set()
+
+    old_sigint = signal.getsignal(signal.SIGINT)
+    old_sigterm = signal.getsignal(signal.SIGTERM)
+    signal.signal(signal.SIGINT, _handle_signal)
+    signal.signal(signal.SIGTERM, _handle_signal)
+
+    try:
+        with open(output_path, "w", encoding="utf-8", buffering=1) as f:
+            f.write("[\n")
+            first_row = True
+
+            def _round_or_none(value: float, digits: int = 2) -> Optional[float]:
+                if math.isnan(value):
+                    return None
+                return round(value, digits)
+
+            def _record(ts_unix_ms: int, imu_records: list[IMUPushRecord]) -> None:
+                nonlocal first_row
+                acc_by_addr = {}
+                gyro_by_addr = {}
+                quaternion_by_addr = {}
+                for record in imu_records:
+                    key = f"0x{record.imu_addr:02X}"
+                    acc_by_addr[key] = {
+                        "x": _round_or_none(record.acc_x),
+                        "y": _round_or_none(record.acc_y),
+                        "z": _round_or_none(record.acc_z),
+                    }
+                    gyro_by_addr[key] = {
+                        "x": _round_or_none(record.gyro_x),
+                        "y": _round_or_none(record.gyro_y),
+                        "z": _round_or_none(record.gyro_z),
+                    }
+                    quaternion_by_addr[key] = {
+                        "w": _round_or_none(record.quat_w, 4),
+                        "x": _round_or_none(record.quat_x, 4),
+                        "y": _round_or_none(record.quat_y, 4),
+                        "z": _round_or_none(record.quat_z, 4),
+                    }
+
+                row = {
+                    "ts_iso": datetime.fromtimestamp(ts_unix_ms / 1000.0).isoformat(timespec="milliseconds"),
+                    "acc_by_addr": {},
+                    "gyro_by_addr": {},
+                    "quaternion_by_addr": {},
+                }
+
+                # 固定列顺序，便于逐行对比同一地址的数据变化。
+                for addr in DEFAULT_IMU_ADDR_COLUMNS:
+                    key = f"0x{addr:02X}"
+                    row["acc_by_addr"][key] = acc_by_addr.get(key)
+                    row["gyro_by_addr"][key] = gyro_by_addr.get(key)
+                    row["quaternion_by_addr"][key] = quaternion_by_addr.get(key)
+
+                # 追加非默认地址，避免丢信息。
+                for key in sorted(quaternion_by_addr.keys()):
+                    if key not in row["quaternion_by_addr"]:
+                        row["acc_by_addr"][key] = acc_by_addr.get(key)
+                        row["gyro_by_addr"][key] = gyro_by_addr.get(key)
+                        row["quaternion_by_addr"][key] = quaternion_by_addr.get(key)
+
+                if not first_row:
+                    f.write(",\n")
+                f.write(json.dumps(row, ensure_ascii=False))
+                f.flush()
+                first_row = False
+
+            client.set_imu_record_callback(_record)
+            while not stop_event.is_set():
+                time.sleep(0.2)
+            client.set_imu_record_callback(None)
+            if not first_row:
+                f.write("\n")
+            f.write("]\n")
+            f.flush()
+    finally:
+        signal.signal(signal.SIGINT, old_sigint)
+        signal.signal(signal.SIGTERM, old_sigterm)
+
+    return 0
+
+
 def add_ws_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--spi-bus", type=lambda x: int(x, 0), default=DEFAULT_SPI_BUS, help="SPI bus id"
@@ -778,6 +955,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     monitor_parser.set_defaults(func=cmd_monitor)
 
+    capture_parser = subparsers.add_parser(
+        "capture",
+        help="background capture mode, write IMU pushes to JSON",
+    )
+    capture_parser.add_argument(
+        "--output",
+        required=True,
+        help="output JSON path",
+    )
+    capture_parser.set_defaults(func=cmd_capture)
+
     return parser
 
 
@@ -786,11 +974,12 @@ def main() -> int:
     args = parser.parse_args()
 
     try:
+        print_imu = args.command != "capture"
         with BridgeClient(
             args.port,
             args.baud,
             args.timeout,
-            print_imu=True,
+            print_imu=print_imu,
             imu_print_hz=args.imu_print_hz,
         ) as client:
             return args.func(client, args)

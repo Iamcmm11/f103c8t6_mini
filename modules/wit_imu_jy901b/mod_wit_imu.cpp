@@ -152,7 +152,7 @@ void WitIMU::UpdateDataFromRegisters() {
   data_.q1 = static_cast<int16_t>(registers_[kRegQ1]) / 32768.0f;
   data_.q2 = static_cast<int16_t>(registers_[kRegQ2]) / 32768.0f;
   data_.q3 = static_cast<int16_t>(registers_[kRegQ3]) / 32768.0f;
-  data_.quat_valid = false;
+  data_.quat_valid = true;
   data_.timestamp_ms = Thread::GetTime();
 }
 

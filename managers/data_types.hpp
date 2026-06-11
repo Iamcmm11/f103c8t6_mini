@@ -12,11 +12,13 @@ enum class ImuSlot : uint8_t {
   Forearm = 0,
   Hand = 1,
   ThumbRoot = 2,
+  ThumbTip = 3,
 };
 
 static constexpr uint8_t kForearmImuI2CAddr = 0x50;
 static constexpr uint8_t kHandImuI2CAddr = 0x51;
 static constexpr uint8_t kThumbRootImuI2CAddr = 0x52;
+static constexpr uint8_t kThumbTipImuI2CAddr = 0x53;
 static constexpr uint8_t kDefaultImuAddress = kForearmImuI2CAddr;
 
 constexpr uint8_t ResolveImuI2CAddress(
@@ -28,6 +30,8 @@ constexpr uint8_t ResolveImuI2CAddress(
       return static_cast<uint8_t>(base_address + 1U);
     case static_cast<uint8_t>(ImuSlot::ThumbRoot):
       return static_cast<uint8_t>(base_address + 2U);
+    case static_cast<uint8_t>(ImuSlot::ThumbTip):
+      return static_cast<uint8_t>(base_address + 3U);
     default:
       return base_address;
   }

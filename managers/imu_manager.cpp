@@ -1,5 +1,7 @@
 #include "imu_manager.hpp"
 
+#include <limits>
+
 #include "FreeRTOS.h"
 #include "task.h"
 
@@ -224,9 +226,19 @@ bool IMUManager::ReadRawIMU(uint8_t index, Module::WitIMU::ImuData& raw_data) {
   }
 
   // Keep the reference behavior: quaternion read failure does not block main data.
-  (void)imus_[index]->ReadReg(kQuatRegStart, kQuatRegCount);
+  const bool quat_ok =
+      imus_[index]->ReadReg(kQuatRegStart, kQuatRegCount) ==
+      Module::WitIMU::ErrorCode::OK;
   imus_[index]->UpdateDataFromRegisters();
   imus_[index]->GetData(raw_data);
+  if (!quat_ok) {
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    raw_data.q0 = nan;
+    raw_data.q1 = nan;
+    raw_data.q2 = nan;
+    raw_data.q3 = nan;
+    raw_data.quat_valid = false;
+  }
 
   return raw_data.acc_valid || raw_data.gyro_valid || raw_data.angle_valid;
 }
@@ -292,10 +304,18 @@ void IMUManager::ConvertIMUData(const Module::WitIMU::ImuData& src,
   dst.mag[1] = src.mag_y;
   dst.mag[2] = src.mag_z;
   dst.temperature = src.temperature;
-  dst.quaternion[0] = 1.0f;
-  dst.quaternion[1] = 0.0f;
-  dst.quaternion[2] = 0.0f;
-  dst.quaternion[3] = 0.0f;
+  if (src.quat_valid) {
+    dst.quaternion[0] = src.q0;
+    dst.quaternion[1] = src.q1;
+    dst.quaternion[2] = src.q2;
+    dst.quaternion[3] = src.q3;
+  } else {
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    dst.quaternion[0] = nan;
+    dst.quaternion[1] = nan;
+    dst.quaternion[2] = nan;
+    dst.quaternion[3] = nan;
+  }
   dst.status = 0;
 }
 

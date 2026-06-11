@@ -1,23 +1,12 @@
-﻿#include "app_main.h"
+#include "app_main.h"
 
-#include "cdc_uart.hpp"
 #include "libxr.hpp"
 #include "main.h"
-#include "stm32_adc.hpp"
-#include "stm32_can.hpp"
-#include "stm32_canfd.hpp"
-#include "stm32_dac.hpp"
-#include "stm32_flash.hpp"
-#include "stm32_gpio.hpp"
 #include "stm32_i2c.hpp"
 #include "stm32_power.hpp"
-#include "stm32_pwm.hpp"
 #include "stm32_spi.hpp"
 #include "stm32_timebase.hpp"
 #include "stm32_uart.hpp"
-#include "stm32_usb_dev.hpp"
-#include "stm32_watchdog.hpp"
-#include "flash_map.hpp"
 
 using namespace LibXR;
 
@@ -57,7 +46,7 @@ extern "C" void app_main(void) {
 
 
 
-  STM32SPI spi1(&hspi1, {nullptr, 0}, spi1_tx_buf, 3);
+  STM32SPI spi1(&hspi1, {nullptr, 0}, spi1_tx_buf, UINT32_MAX);
 
   STM32UART usart1(&huart1,
               usart1_rx_buf, usart1_tx_buf, 5);
@@ -82,7 +71,7 @@ extern "C" void app_main(void) {
   bridge_config.stream_relative_euler = false;
   bridge_config.push_imu_euler_in_bridge = true;
   bridge_config.stream_interval_ms = 20;
-  bridge_config.stack_size = 768;
+  bridge_config.stack_size = 1000;
   static Application::IMUUartBridgeTask imu_bridge(
       &usart1, &i2c1, &spi1, &imu_manager, &ws2812_manager, bridge_config);
   (void)imu_bridge.Start();

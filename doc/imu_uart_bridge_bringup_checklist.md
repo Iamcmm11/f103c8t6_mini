@@ -182,7 +182,7 @@ python utils/python/imu_uart_bridge_test.py --port COMx console
 - 终端应持续输出形如：
 
 ```text
-imu_bundle,3,0x50,roll,pitch,yaw,0x51,roll,pitch,yaw,0x52,roll,pitch,yaw
+imu_bundle,4,0x50,roll,pitch,yaw,0x51,roll,pitch,yaw,0x52,roll,pitch,yaw,0x53,roll,pitch,yaw
 ```
 
 - `console` expected format: `imu_bundle,count,<addr,r,p,y>...`

@@ -19,20 +19,23 @@ constexpr uint8_t kBridgeCmdI2CWrite = 0x11;
 constexpr uint8_t kBridgeCmdSPIWrite = 0x20;
 constexpr uint8_t kBridgeCmdWS2812Frame = 0x21;
 constexpr uint8_t kBridgeCmdIMUEulerPush = 0x30;
-constexpr uint8_t kBridgeStatusOk = 0;
-constexpr uint8_t kBridgeStatusError = 1;
-constexpr uint8_t kMaxRegisterCount = 32;
-constexpr uint16_t kBridgeMaxResponsePayload = 80;
-constexpr uint16_t kBridgeChunkSize = 32;
-constexpr uint32_t kBridgePollTimeoutMs = 2;
-constexpr uint8_t kBridgeIMUPushRecordSize = 13;
-constexpr uint32_t kTaskCreateOverheadBytes = 384;
-constexpr uint32_t kTaskCreateSafetyBytes = 256;
 constexpr std::array<uint8_t, 3> kBridgeIMUPushIndexes = {
     static_cast<uint8_t>(Manager::ImuSlot::Forearm),
     static_cast<uint8_t>(Manager::ImuSlot::Hand),
     static_cast<uint8_t>(Manager::ImuSlot::ThumbRoot),
 };
+constexpr uint8_t kBridgeIMUPushFloatCount = 4;
+constexpr uint8_t kBridgeIMUPushRecordSize =
+    static_cast<uint8_t>(1 + kBridgeIMUPushFloatCount * sizeof(float));
+constexpr uint8_t kBridgeStatusOk = 0;
+constexpr uint8_t kBridgeStatusError = 1;
+constexpr uint8_t kMaxRegisterCount = 32;
+constexpr uint16_t kBridgeMaxResponsePayload = static_cast<uint16_t>(
+    1 + kBridgeIMUPushIndexes.size() * kBridgeIMUPushRecordSize);
+constexpr uint16_t kBridgeChunkSize = 32;
+constexpr uint32_t kBridgePollTimeoutMs = 2;
+constexpr uint32_t kTaskCreateOverheadBytes = 384;
+constexpr uint32_t kTaskCreateSafetyBytes = 256;
 
 }  // namespace
 
@@ -532,21 +535,21 @@ void IMUUartBridgeTask::PublishBridgeIMUData() {
         continue;
       }
 
-      float roll = std::numeric_limits<float>::quiet_NaN();
-      float pitch = std::numeric_limits<float>::quiet_NaN();
-      float yaw = std::numeric_limits<float>::quiet_NaN();
+      std::array<float, kBridgeIMUPushFloatCount> values{};
+      values.fill(std::numeric_limits<float>::quiet_NaN());
       if (valid) {
         const auto& imu = imu_msg.imu_data[imu_index];
-        roll = imu.angle[0];
-        pitch = imu.angle[1];
-        yaw = imu.angle[2];
+        values = {imu.quaternion[0], imu.quaternion[1], imu.quaternion[2],
+                  imu.quaternion[3]};
       }
 
       const uint16_t base = payload_len;
       payload[base] = Manager::ResolveImuI2CAddress(imu_index, config_.imu_addr);
-      std::memcpy(payload.data() + base + 1, &roll, sizeof(float));
-      std::memcpy(payload.data() + base + 5, &pitch, sizeof(float));
-      std::memcpy(payload.data() + base + 9, &yaw, sizeof(float));
+      uint16_t cursor = static_cast<uint16_t>(base + 1);
+      for (const float value : values) {
+        std::memcpy(payload.data() + cursor, &value, sizeof(float));
+        cursor = static_cast<uint16_t>(cursor + sizeof(float));
+      }
       ++payload[0];
       payload_len =
           static_cast<uint16_t>(payload_len + kBridgeIMUPushRecordSize);
