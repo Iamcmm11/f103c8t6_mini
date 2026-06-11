@@ -1,0 +1,661 @@
+From 16356ec1e2c0ec13546d73ac487b460f7c1698ec Mon Sep 17 00:00:00 2001
+From: Iamcmm11 <icescuc@gmail.com>
+Date: Thu, 4 Jun 2026 18:18:57 +0800
+Subject: [PATCH] =?UTF-8?q?=E4=BC=98=E5=8C=96?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ driver/st/stm32_i2c.cpp    | 224 +++++++++++++++++++++++++++++++++----
+ driver/st/stm32_i2c.hpp    |   5 +
+ driver/st/stm32_uart.cpp   | 136 ++++++++++++++++++++--
+ driver/st/stm32_uart.hpp   |  19 ++++
+ src/driver/i2c.hpp         |   8 ++
+ src/middleware/message.cpp |   7 ++
+ 6 files changed, 367 insertions(+), 32 deletions(-)
+
+diff --git a/driver/st/stm32_i2c.cpp b/driver/st/stm32_i2c.cpp
+index b2f16b0..eac93eb 100644
+--- a/driver/st/stm32_i2c.cpp
++++ b/driver/st/stm32_i2c.cpp
+@@ -1,11 +1,50 @@
+ #include "stm32_i2c.hpp"
++#include "i2c.h"
+ 
+ #ifdef HAL_I2C_MODULE_ENABLED
+ 
++#include "FreeRTOS.h"
++#include "task.h"
++
+ using namespace LibXR;
+ 
+ STM32I2C *STM32I2C::map[STM32_I2C_NUMBER] = {nullptr};
+ 
++namespace {
++
++constexpr uint32_t kRecoveryPulseCount = 9;
++constexpr uint32_t kRecoveryDelayMs = 1;
++
++void DelayForRecovery()
++{
++  HAL_Delay(kRecoveryDelayMs);
++}
++
++void ConfigureRecoveryPinsForI2C1()
++{
++  __HAL_RCC_GPIOB_CLK_ENABLE();
++
++  GPIO_InitTypeDef gpio = {0};
++  gpio.Pin = GPIO_PIN_6 | GPIO_PIN_7;
++  gpio.Mode = GPIO_MODE_OUTPUT_OD;
++  gpio.Speed = GPIO_SPEED_FREQ_HIGH;
++  HAL_GPIO_Init(GPIOB, &gpio);
++
++  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6 | GPIO_PIN_7, GPIO_PIN_SET);
++}
++
++void GenerateStopForI2C1()
++{
++  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_7, GPIO_PIN_RESET);
++  DelayForRecovery();
++  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_SET);
++  DelayForRecovery();
++  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_7, GPIO_PIN_SET);
++  DelayForRecovery();
++}
++
++}  // namespace
++
+ stm32_i2c_id_t STM32_I2C_GetID(I2C_TypeDef *hi2c)
+ {  // NOLINT
+   if (hi2c == nullptr)
+@@ -74,6 +113,51 @@ STM32I2C::STM32I2C(I2C_HandleTypeDef *hi2c, RawData dma_buff,
+   map[id_] = this;
+ }
+ 
++void STM32I2C::ClearPendingOperation(bool in_isr)
++{
++  if (in_isr)
++  {
++    const UBaseType_t interrupt_mask = taskENTER_CRITICAL_FROM_ISR();
++    read_op_ = ReadOperation();
++    write_op_ = WriteOperation();
++    read_buff_ = RawData();
++    taskEXIT_CRITICAL_FROM_ISR(interrupt_mask);
++    return;
++  }
++
++  taskENTER_CRITICAL();
++  read_op_ = ReadOperation();
++  write_op_ = WriteOperation();
++  read_buff_ = RawData();
++  taskEXIT_CRITICAL();
++}
++
++void STM32I2C::AbortTransfer(uint16_t slave_addr)
++{
++  if (i2c_handle_ == nullptr)
++  {
++    return;
++  }
++
++  if (i2c_handle_->State != HAL_I2C_STATE_READY)
++  {
++    (void)HAL_I2C_Master_Abort_IT(i2c_handle_, slave_addr);
++  }
++}
++
++ErrorCode STM32I2C::WaitBlockingDma(WriteOperation &op, uint16_t slave_addr)
++{
++  const ErrorCode wait_ec = op.data.sem_info.sem->Wait(op.data.sem_info.timeout);
++  if (wait_ec != ErrorCode::OK)
++  {
++    ClearPendingOperation();
++    AbortTransfer(slave_addr);
++    return wait_ec;
++  }
++
++  return ErrorCode::OK;
++}
++
+ ErrorCode STM32I2C::Read(uint16_t slave_addr, RawData read_data, ReadOperation &op,
+                          bool in_isr)
+ {
+@@ -87,14 +171,20 @@ ErrorCode STM32I2C::Read(uint16_t slave_addr, RawData read_data, ReadOperation &
+   if (read_data.size_ > dma_enable_min_size_)
+   {
+     read_op_ = op;
+-    HAL_I2C_Master_Receive_DMA(i2c_handle_, slave_addr,
+-                               reinterpret_cast<uint8_t *>(dma_buff_.addr_),
+-                               read_data.size_);
++    const HAL_StatusTypeDef st =
++        HAL_I2C_Master_Receive_DMA(i2c_handle_, slave_addr,
++                                   reinterpret_cast<uint8_t *>(dma_buff_.addr_),
++                                   read_data.size_);
++    if (st != HAL_OK)
++    {
++      ClearPendingOperation();
++      return ErrorCode::BUSY;
++    }
+     read_buff_ = read_data;
+     op.MarkAsRunning();
+     if (op.type == ReadOperation::OperationType::BLOCK)
+     {
+-      return op.data.sem_info.sem->Wait(op.data.sem_info.timeout);
++      return WaitBlockingDma(op, slave_addr);
+     }
+     return ErrorCode::OK;
+   }
+@@ -133,13 +223,19 @@ ErrorCode STM32I2C::Write(uint16_t slave_addr, ConstRawData write_data,
+     SCB_CleanDCache_by_Addr(reinterpret_cast<uint32_t *>(dma_buff_.addr_),
+                             write_data.size_);
+ #endif
+-    HAL_I2C_Master_Transmit_DMA(i2c_handle_, slave_addr,
+-                                reinterpret_cast<uint8_t *>(dma_buff_.addr_),
+-                                write_data.size_);
++    const HAL_StatusTypeDef st =
++        HAL_I2C_Master_Transmit_DMA(i2c_handle_, slave_addr,
++                                    reinterpret_cast<uint8_t *>(dma_buff_.addr_),
++                                    write_data.size_);
++    if (st != HAL_OK)
++    {
++      ClearPendingOperation();
++      return ErrorCode::BUSY;
++    }
+     op.MarkAsRunning();
+     if (op.type == WriteOperation::OperationType::BLOCK)
+     {
+-      return op.data.sem_info.sem->Wait(op.data.sem_info.timeout);
++      return WaitBlockingDma(op, slave_addr);
+     }
+     return ErrorCode::OK;
+   }
+@@ -174,15 +270,23 @@ ErrorCode STM32I2C::MemRead(uint16_t slave_addr, uint16_t mem_addr, RawData read
+   if (read_data.size_ > dma_enable_min_size_)
+   {
+     read_op_ = op;
+-    HAL_I2C_Mem_Read_DMA(i2c_handle_, slave_addr, mem_addr,
+-                         mem_addr_size == MemAddrLength::BYTE_8 ? I2C_MEMADD_SIZE_8BIT
+-                                                                : I2C_MEMADD_SIZE_16BIT,
+-                         reinterpret_cast<uint8_t *>(dma_buff_.addr_), read_data.size_);
++    const HAL_StatusTypeDef st =
++        HAL_I2C_Mem_Read_DMA(i2c_handle_, slave_addr, mem_addr,
++                             mem_addr_size == MemAddrLength::BYTE_8
++                                 ? I2C_MEMADD_SIZE_8BIT
++                                 : I2C_MEMADD_SIZE_16BIT,
++                             reinterpret_cast<uint8_t *>(dma_buff_.addr_),
++                             read_data.size_);
++    if (st != HAL_OK)
++    {
++      ClearPendingOperation();
++      return ErrorCode::BUSY;
++    }
+     read_buff_ = read_data;
+     op.MarkAsRunning();
+     if (op.type == ReadOperation::OperationType::BLOCK)
+     {
+-      return op.data.sem_info.sem->Wait(op.data.sem_info.timeout);
++      return WaitBlockingDma(op, slave_addr);
+     }
+     return ErrorCode::OK;
+   }
+@@ -228,14 +332,22 @@ ErrorCode STM32I2C::MemWrite(uint16_t slave_addr, uint16_t mem_addr,
+     SCB_CleanDCache_by_Addr(reinterpret_cast<uint32_t *>(dma_buff_.addr_),
+                             write_data.size_);
+ #endif
+-    HAL_I2C_Mem_Write_DMA(i2c_handle_, slave_addr, mem_addr,
+-                          mem_addr_size == MemAddrLength::BYTE_8 ? I2C_MEMADD_SIZE_8BIT
+-                                                                 : I2C_MEMADD_SIZE_16BIT,
+-                          reinterpret_cast<uint8_t *>(dma_buff_.addr_), write_data.size_);
++    const HAL_StatusTypeDef st =
++        HAL_I2C_Mem_Write_DMA(i2c_handle_, slave_addr, mem_addr,
++                              mem_addr_size == MemAddrLength::BYTE_8
++                                  ? I2C_MEMADD_SIZE_8BIT
++                                  : I2C_MEMADD_SIZE_16BIT,
++                              reinterpret_cast<uint8_t *>(dma_buff_.addr_),
++                              write_data.size_);
++    if (st != HAL_OK)
++    {
++      ClearPendingOperation();
++      return ErrorCode::BUSY;
++    }
+     op.MarkAsRunning();
+     if (op.type == WriteOperation::OperationType::BLOCK)
+     {
+-      return op.data.sem_info.sem->Wait(op.data.sem_info.timeout);
++      return WaitBlockingDma(op, slave_addr);
+     }
+     return ErrorCode::OK;
+   }
+@@ -277,16 +389,64 @@ ErrorCode STM32I2C::SetConfig(Configuration config)
+   return ErrorCode::OK;
+ }
+ 
++ErrorCode STM32I2C::RecoverBus()
++{
++  if (i2c_handle_ == nullptr)
++  {
++    return ErrorCode::PTR_NULL;
++  }
++
++  if (id_ != stm32_i2c_id_t::STM32_I2C1)
++  {
++    return ErrorCode::NOT_SUPPORT;
++  }
++
++  (void)HAL_I2C_DeInit(i2c_handle_);
++
++  ConfigureRecoveryPinsForI2C1();
++  DelayForRecovery();
++
++  if (HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_7) == GPIO_PIN_RESET)
++  {
++    for (uint32_t i = 0; i < kRecoveryPulseCount; ++i)
++    {
++      HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_RESET);
++      DelayForRecovery();
++      HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_SET);
++      DelayForRecovery();
++
++      if (HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_7) == GPIO_PIN_SET)
++      {
++        break;
++      }
++    }
++  }
++
++  GenerateStopForI2C1();
++  MX_I2C1_Init();
++
++  return (i2c_handle_->State == HAL_I2C_STATE_READY) ? ErrorCode::OK
++                                                     : ErrorCode::FAILED;
++}
++
+ extern "C" void HAL_I2C_MasterRxCpltCallback(I2C_HandleTypeDef *hi2c)
+ {
+   STM32I2C *i2c = STM32I2C::map[STM32_I2C_GetID(hi2c->Instance)];
+   if (i2c)
+   {
+ #if defined(__DCACHE_PRESENT) && (__DCACHE_PRESENT == 1U)
+-    SCB_InvalidateDCache_by_Addr(i2c->dma_buff_.addr_, i2c->read_buff_.size_);
++    if (i2c->read_buff_.size_ > 0)
++    {
++      SCB_InvalidateDCache_by_Addr(i2c->dma_buff_.addr_, i2c->read_buff_.size_);
++    }
+ #endif
+-    Memory::FastCopy(i2c->read_buff_.addr_, i2c->dma_buff_.addr_, i2c->read_buff_.size_);
++    if (i2c->read_buff_.size_ > 0)
++    {
++      Memory::FastCopy(i2c->read_buff_.addr_, i2c->dma_buff_.addr_,
++                       i2c->read_buff_.size_);
++    }
+     i2c->read_op_.UpdateStatus(true, ErrorCode::OK);
++    i2c->ClearPendingOperation(true);
+   }
+ }
+ 
+@@ -296,6 +456,7 @@ extern "C" void HAL_I2C_MasterTxCpltCallback(I2C_HandleTypeDef *hi2c)
+   if (i2c)
+   {
+     i2c->write_op_.UpdateStatus(true, ErrorCode::OK);
++    i2c->ClearPendingOperation(true);
+   }
+ }
+ 
+@@ -305,6 +466,7 @@ extern "C" void HAL_I2C_MemTxCpltCallback(I2C_HandleTypeDef *hi2c)
+   if (i2c)
+   {
+     i2c->write_op_.UpdateStatus(true, ErrorCode::OK);
++    i2c->ClearPendingOperation(true);
+   }
+ }
+ 
+@@ -314,10 +476,18 @@ extern "C" void HAL_I2C_MemRxCpltCallback(I2C_HandleTypeDef *hi2c)
+   if (i2c)
+   {
+ #if defined(__DCACHE_PRESENT) && (__DCACHE_PRESENT == 1U)
+-    SCB_InvalidateDCache_by_Addr(i2c->dma_buff_.addr_, i2c->read_buff_.size_);
++    if (i2c->read_buff_.size_ > 0)
++    {
++      SCB_InvalidateDCache_by_Addr(i2c->dma_buff_.addr_, i2c->read_buff_.size_);
++    }
+ #endif
+-    Memory::FastCopy(i2c->read_buff_.addr_, i2c->dma_buff_.addr_, i2c->read_buff_.size_);
++    if (i2c->read_buff_.size_ > 0)
++    {
++      Memory::FastCopy(i2c->read_buff_.addr_, i2c->dma_buff_.addr_,
++                       i2c->read_buff_.size_);
++    }
+     i2c->read_op_.UpdateStatus(true, ErrorCode::OK);
++    i2c->ClearPendingOperation(true);
+   }
+ }
+ 
+@@ -335,6 +505,16 @@ extern "C" void HAL_I2C_ErrorCallback(I2C_HandleTypeDef *hi2c)
+     {
+       i2c->write_op_.UpdateStatus(true, ErrorCode::FAILED);
+     }
++    i2c->ClearPendingOperation(true);
++  }
++}
++
++extern "C" void HAL_I2C_AbortCpltCallback(I2C_HandleTypeDef *hi2c)
++{
++  STM32I2C *i2c = STM32I2C::map[STM32_I2C_GetID(hi2c->Instance)];
++  if (i2c)
++  {
++    i2c->ClearPendingOperation(true);
+   }
+ }
+ 
+diff --git a/driver/st/stm32_i2c.hpp b/driver/st/stm32_i2c.hpp
+index 4f5ea15..e03bc2e 100644
+--- a/driver/st/stm32_i2c.hpp
++++ b/driver/st/stm32_i2c.hpp
+@@ -87,6 +87,11 @@ class STM32I2C : public I2C
+   }
+ 
+   ErrorCode SetConfig(Configuration config) override;
++  ErrorCode RecoverBus() override;
++
++  void ClearPendingOperation(bool in_isr = false);
++  void AbortTransfer(uint16_t slave_addr);
++  ErrorCode WaitBlockingDma(WriteOperation &op, uint16_t slave_addr);
+ 
+   stm32_i2c_id_t id_;
+   I2C_HandleTypeDef *i2c_handle_;
+diff --git a/driver/st/stm32_uart.cpp b/driver/st/stm32_uart.cpp
+index cc6f35f..9f1ec2c 100644
+--- a/driver/st/stm32_uart.cpp
++++ b/driver/st/stm32_uart.cpp
+@@ -259,6 +259,7 @@ ErrorCode STM32UART::WriteFun(WritePort &port, bool)
+ 
+     if (ans != HAL_OK)
+     {
++      ++uart->diag_stats_.tx_start_fail_count;
+       uart->tx_busy_.Clear();
+       return ErrorCode::FAILED;
+     }
+@@ -273,6 +274,24 @@ ErrorCode STM32UART::WriteFun(WritePort &port, bool)
+ 
+ ErrorCode STM32UART::ReadFun(ReadPort &, bool) { return ErrorCode::PENDING; }
+ 
++STM32UARTDiagStats STM32UART::GetDiagStats() const
++{
++  STM32UARTDiagStats stats;
++  stats.rx_event_count = diag_stats_.rx_event_count;
++  stats.rx_received_bytes = diag_stats_.rx_received_bytes;
++  stats.rx_queued_bytes = diag_stats_.rx_queued_bytes;
++  stats.rx_dropped_bytes = diag_stats_.rx_dropped_bytes;
++  stats.rx_queue_full_count = diag_stats_.rx_queue_full_count;
++  stats.rx_restart_count = diag_stats_.rx_restart_count;
++  stats.rx_restart_fail_count = diag_stats_.rx_restart_fail_count;
++  stats.uart_error_count = diag_stats_.uart_error_count;
++  stats.uart_abort_count = diag_stats_.uart_abort_count;
++  stats.last_uart_error_code = diag_stats_.last_uart_error_code;
++  stats.tx_complete_count = diag_stats_.tx_complete_count;
++  stats.tx_start_fail_count = diag_stats_.tx_start_fail_count;
++  return stats;
++}
++
+ STM32UART::STM32UART(UART_HandleTypeDef *uart_handle, RawData dma_buff_rx,
+                      RawData dma_buff_tx, uint32_t tx_queue_size)
+     : UART(&_read_port, &_write_port),
+@@ -358,17 +377,82 @@ void STM32UART::SetRxDMA()
+     uart_handle_->hdmarx->Init.Mode = DMA_CIRCULAR;
+     HAL_DMA_Init(uart_handle_->hdmarx);
+ 
+-    HAL_UARTEx_ReceiveToIdle_DMA(uart_handle_,
+-                                 reinterpret_cast<uint8_t *>(dma_buff_rx_.addr_),
+-                                 dma_buff_rx_.size_);
++    ++diag_stats_.rx_restart_count;
++    auto ans = HAL_UARTEx_ReceiveToIdle_DMA(
++        uart_handle_, reinterpret_cast<uint8_t *>(dma_buff_rx_.addr_),
++        dma_buff_rx_.size_);
++    if (ans != HAL_OK)
++    {
++      ++diag_stats_.rx_restart_fail_count;
++    }
+     _read_port = ReadFun;
+   }
+ }
+ 
++static inline void STM32_UART_RX_Push(STM32UART *uart, uint8_t *data, size_t len)
++{
++  if (len == 0)
++  {
++    return;
++  }
++
++  uart->diag_stats_.rx_received_bytes += len;
++  auto ans = uart->read_port_->queue_data_->PushBatch(data, len);
++  if (ans == ErrorCode::OK)
++  {
++    uart->diag_stats_.rx_queued_bytes += len;
++  }
++  else
++  {
++    ++uart->diag_stats_.rx_queue_full_count;
++    uart->diag_stats_.rx_dropped_bytes += len;
++  }
++}
++
++static inline HAL_StatusTypeDef STM32_UART_Restart_RX_DMA(STM32UART *uart)
++{
++  if (uart == nullptr || uart->uart_handle_ == nullptr ||
++      uart->dma_buff_rx_.addr_ == nullptr || uart->dma_buff_rx_.size_ == 0)
++  {
++    return HAL_ERROR;
++  }
++
++  auto huart = uart->uart_handle_;
++
++  ATOMIC_CLEAR_BIT(huart->Instance->CR1,
++                   USART_CR1_IDLEIE | USART_CR1_RXNEIE | USART_CR1_PEIE);
++  ATOMIC_CLEAR_BIT(huart->Instance->CR3, USART_CR3_EIE | USART_CR3_DMAR);
++
++  __HAL_UART_CLEAR_PEFLAG(huart);
++  __HAL_UART_CLEAR_IDLEFLAG(huart);
++
++  huart->RxXferCount = 0;
++  huart->RxState = HAL_UART_STATE_READY;
++  huart->ReceptionType = HAL_UART_RECEPTION_STANDARD;
++  huart->ErrorCode = HAL_UART_ERROR_NONE;
++  uart->last_rx_pos_ = 0;
++
++  ++uart->diag_stats_.rx_restart_count;
++  auto ans = HAL_UARTEx_ReceiveToIdle_DMA(
++      huart, reinterpret_cast<uint8_t *>(uart->dma_buff_rx_.addr_),
++      uart->dma_buff_rx_.size_);
++  if (ans != HAL_OK)
++  {
++    ++uart->diag_stats_.rx_restart_fail_count;
++  }
++  return ans;
++}
++
+ // NOLINTNEXTLINE
+ static inline void STM32_UART_RX_ISR_Handler(UART_HandleTypeDef *uart_handle)
+ {
+   auto uart = STM32UART::map[stm32_uart_get_id(uart_handle->Instance)];
++  if (uart == nullptr)
++  {
++    return;
++  }
++
++  ++uart->diag_stats_.rx_event_count;
+   auto rx_buf = static_cast<uint8_t *>(uart->dma_buff_rx_.addr_);
+   size_t dma_size = uart->dma_buff_rx_.size_;
+ 
+@@ -385,13 +469,13 @@ static inline void STM32_UART_RX_ISR_Handler(UART_HandleTypeDef *uart_handle)
+     if (curr_pos > last_pos)
+     {
+       // 线性接收区
+-      uart->read_port_->queue_data_->PushBatch(&rx_buf[last_pos], curr_pos - last_pos);
++      STM32_UART_RX_Push(uart, &rx_buf[last_pos], curr_pos - last_pos);
+     }
+     else
+     {
+       // 回卷区：last→end，再从0→curr
+-      uart->read_port_->queue_data_->PushBatch(&rx_buf[last_pos], dma_size - last_pos);
+-      uart->read_port_->queue_data_->PushBatch(&rx_buf[0], curr_pos);
++      STM32_UART_RX_Push(uart, &rx_buf[last_pos], dma_size - last_pos);
++      STM32_UART_RX_Push(uart, &rx_buf[0], curr_pos);
+     }
+ 
+     uart->last_rx_pos_ = curr_pos;
+@@ -403,7 +487,12 @@ static inline void STM32_UART_RX_ISR_Handler(UART_HandleTypeDef *uart_handle)
+ void STM32_UART_ISR_Handler_TX_CPLT(stm32_uart_id_t id)
+ {
+   auto uart = STM32UART::map[id];
++  if (uart == nullptr)
++  {
++    return;
++  }
+ 
++  ++uart->diag_stats_.tx_complete_count;
+   uart->tx_busy_.Clear();
+ 
+   Flag::ScopedRestore tx_flag(uart->in_tx_isr);
+@@ -429,6 +518,11 @@ void STM32_UART_ISR_Handler_TX_CPLT(stm32_uart_id_t id)
+       uart->uart_handle_, static_cast<uint8_t *>(uart->dma_buff_tx_.ActiveBuffer()),
+       pending_len);
+ 
++  if (ans != HAL_OK)
++  {
++    ++uart->diag_stats_.tx_start_fail_count;
++  }
++
+   ASSERT(ans == HAL_OK);
+ 
+   WriteInfoBlock &current_info = uart->write_info_active_;
+@@ -474,18 +568,40 @@ extern "C" void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
+ 
+ extern "C" __attribute__((used)) void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
+ {
+-  HAL_UART_Abort_IT(huart);
++  auto uart = STM32UART::map[stm32_uart_get_id(huart->Instance)];
++  if (uart != nullptr)
++  {
++    ++uart->diag_stats_.uart_error_count;
++    uart->diag_stats_.last_uart_error_code = huart->ErrorCode;
++    (void)STM32_UART_Restart_RX_DMA(uart);
++  }
+ }
+ 
+ extern "C" void HAL_UART_AbortCpltCallback(UART_HandleTypeDef *huart)
+ {
+   auto uart = STM32UART::map[stm32_uart_get_id(huart->Instance)];
++  if (uart == nullptr)
++  {
++    return;
++  }
++
++  ++uart->diag_stats_.uart_abort_count;
+   uart->last_rx_pos_ = 0;
+-  HAL_UARTEx_ReceiveToIdle_DMA(huart, huart->pRxBuffPtr, uart->dma_buff_rx_.size_);
++  ++uart->diag_stats_.rx_restart_count;
++  auto ans =
++      HAL_UARTEx_ReceiveToIdle_DMA(huart, huart->pRxBuffPtr, uart->dma_buff_rx_.size_);
++  if (ans != HAL_OK)
++  {
++    ++uart->diag_stats_.rx_restart_fail_count;
++  }
+   if (uart->tx_busy_.IsSet())
+   {
+-    HAL_UART_Transmit_DMA(huart, uart->dma_buff_tx_.ActiveBuffer(),
+-                          uart->dma_buff_tx_.GetActiveLength());
++    ans = HAL_UART_Transmit_DMA(huart, uart->dma_buff_tx_.ActiveBuffer(),
++                                uart->dma_buff_tx_.GetActiveLength());
++    if (ans != HAL_OK)
++    {
++      ++uart->diag_stats_.tx_start_fail_count;
++    }
+   }
+ }
+ 
+diff --git a/driver/st/stm32_uart.hpp b/driver/st/stm32_uart.hpp
+index c2ea7d7..962aaa0 100644
+--- a/driver/st/stm32_uart.hpp
++++ b/driver/st/stm32_uart.hpp
+@@ -111,6 +111,22 @@ stm32_uart_id_t stm32_uart_get_id(USART_TypeDef *addr);
+ 
+ namespace LibXR
+ {
++struct STM32UARTDiagStats
++{
++  uint32_t rx_event_count = 0;
++  uint32_t rx_received_bytes = 0;
++  uint32_t rx_queued_bytes = 0;
++  uint32_t rx_dropped_bytes = 0;
++  uint32_t rx_queue_full_count = 0;
++  uint32_t rx_restart_count = 0;
++  uint32_t rx_restart_fail_count = 0;
++  uint32_t uart_error_count = 0;
++  uint32_t uart_abort_count = 0;
++  uint32_t last_uart_error_code = 0;
++  uint32_t tx_complete_count = 0;
++  uint32_t tx_start_fail_count = 0;
++};
++
+ class STM32UART : public UART
+ {
+  public:
+@@ -125,6 +141,8 @@ class STM32UART : public UART
+ 
+   void SetRxDMA();
+ 
++  STM32UARTDiagStats GetDiagStats() const;
++
+   ReadPort _read_port;
+   WritePort _write_port;
+ 
+@@ -139,6 +157,7 @@ class STM32UART : public UART
+   Flag::Plain in_tx_isr, tx_busy_;
+ 
+   stm32_uart_id_t id_ = STM32_UART_ID_ERROR;
++  STM32UARTDiagStats diag_stats_;
+ 
+   static STM32UART *map[STM32_UART_NUMBER];  // NOLINT
+ };
+diff --git a/src/driver/i2c.hpp b/src/driver/i2c.hpp
+index 9e57b78..b9d09a9 100644
+--- a/src/driver/i2c.hpp
++++ b/src/driver/i2c.hpp
+@@ -95,6 +95,14 @@ class I2C
+    */
+   virtual ErrorCode SetConfig(Configuration config) = 0;
+ 
++  /**
++   * @brief 尝试恢复 I2C 总线或外设状态。
++   *        Attempts to recover the I2C bus or peripheral state.
++   *
++   * 默认实现返回 NOT_SUPPORT，具体平台可按需覆写。
++   */
++  virtual ErrorCode RecoverBus() { return ErrorCode::NOT_SUPPORT; }
++
+   /**
+    * @brief 从 I2C 设备指定寄存器读取数据。
+    *        Reads data from a specific register of an I2C device.
+diff --git a/src/middleware/message.cpp b/src/middleware/message.cpp
+index f38dd1b..76cd43a 100644
+--- a/src/middleware/message.cpp
++++ b/src/middleware/message.cpp
+@@ -196,6 +196,13 @@ Topic::TopicHandle Topic::Find(const char *name, Domain *domain)
+     domain = def_domain_;
+   }
+ 
++  // 如果默认 domain 还没被任何 Topic 构造过，直接返回空，
++  // 让上层决定是等待还是走降级路径，避免空指针解引用。
++  if (domain == nullptr || domain->node_ == nullptr)
++  {
++    return nullptr;
++  }
++
+   auto crc32 = CRC32::Calculate(name, strlen(name));
+ 
+   return domain->node_->data_.Search<Block>(crc32);
+-- 
+2.52.0.windows.1
+
