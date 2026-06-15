@@ -77,7 +77,6 @@ LibXR::ErrorCode SyncSignalManager::RegisterPwmOutput(
 
 LibXR::ErrorCode SyncSignalManager::StartAll() {
   LibXR::ErrorCode final_result = LibXR::ErrorCode::OK;
-  const uint64_t session_start_mcu_tick_us = LibXR::Timebase::GetMicroseconds();
 
   for (size_t i = 0; i < output_count_; ++i) {
     if (outputs_[i].pwm != nullptr) {
@@ -85,6 +84,14 @@ LibXR::ErrorCode SyncSignalManager::StartAll() {
     }
   }
 
+  for (size_t i = 0; i < output_count_; ++i) {
+    const SyncPwmOutputConfig& output = outputs_[i];
+    if (output.before_enable != nullptr) {
+      output.before_enable(output.context);
+    }
+  }
+
+  const uint64_t session_start_mcu_tick_us = LibXR::Timebase::GetMicroseconds();
   taskENTER_CRITICAL();
   ResetSessionStateFromCritical(session_start_mcu_tick_us);
   sync_event_queue.active = true;
@@ -92,10 +99,6 @@ LibXR::ErrorCode SyncSignalManager::StartAll() {
 
   for (size_t i = 0; i < output_count_; ++i) {
     const SyncPwmOutputConfig& output = outputs_[i];
-    if (output.before_enable != nullptr) {
-      output.before_enable(output.context);
-    }
-
     const LibXR::ErrorCode ec = output.pwm->Enable();
     last_start_results_[i] = ec;
     if (ec == LibXR::ErrorCode::OK) {
@@ -137,6 +140,74 @@ LibXR::ErrorCode SyncSignalManager::StopAll() {
   return final_result;
 }
 
+LibXR::ErrorCode SyncSignalManager::StartOnly(SyncEventSource source) {
+  size_t output_index = outputs_.size();
+  for (size_t i = 0; i < output_count_; ++i) {
+    if (outputs_[i].source == source) {
+      output_index = i;
+      break;
+    }
+  }
+  if (output_index >= output_count_) {
+    return LibXR::ErrorCode::NOT_FOUND;
+  }
+  SyncPwmOutputConfig& output = outputs_[output_index];
+  LibXR::ErrorCode& last_result = last_start_results_[output_index];
+
+  if (output.pwm != nullptr) {
+    (void)output.pwm->Disable();
+  }
+
+  const uint64_t session_start_mcu_tick_us = LibXR::Timebase::GetMicroseconds();
+  taskENTER_CRITICAL();
+  ResetSessionStateFromCritical(session_start_mcu_tick_us);
+  sync_event_queue.active = true;
+  taskEXIT_CRITICAL();
+
+  if (output.before_enable != nullptr) {
+    output.before_enable(output.context);
+  }
+
+  const LibXR::ErrorCode ec = output.pwm->Enable();
+  last_result = ec;
+  if (ec != LibXR::ErrorCode::OK) {
+    (void)StopOnly(source);
+    return ec;
+  }
+
+  RecordEvent(source, session_start_mcu_tick_us);
+  return LibXR::ErrorCode::OK;
+}
+
+LibXR::ErrorCode SyncSignalManager::StopOnly(SyncEventSource source) {
+  size_t output_index = outputs_.size();
+  for (size_t i = 0; i < output_count_; ++i) {
+    if (outputs_[i].source == source) {
+      output_index = i;
+      break;
+    }
+  }
+  if (output_index >= output_count_) {
+    return LibXR::ErrorCode::NOT_FOUND;
+  }
+  SyncPwmOutputConfig& output = outputs_[output_index];
+
+  taskENTER_CRITICAL();
+  sync_event_queue.active = false;
+  sync_event_queue.head = 0;
+  sync_event_queue.tail = 0;
+  sync_event_queue.dropped_count = 0;
+  for (size_t i = 0; i < kSyncEventSourceCount; ++i) {
+    sync_event_queue.latest[i] = SyncEventRecord{};
+  }
+  taskEXIT_CRITICAL();
+
+  if (output.pwm == nullptr) {
+    return LibXR::ErrorCode::OK;
+  }
+  return output.pwm->Disable();
+}
+
 LibXR::ErrorCode SyncSignalManager::GetLastStartResult(
     SyncEventSource source) const {
   for (size_t i = 0; i < output_count_; ++i) {
@@ -159,6 +230,22 @@ LibXR::ErrorCode SyncSignalManager::StopRegisteredOutputs() {
     return LibXR::ErrorCode::INIT_ERR;
   }
   return active_manager->StopAll();
+}
+
+LibXR::ErrorCode SyncSignalManager::StartRegisteredOutput(
+    SyncEventSource source) {
+  if (active_manager == nullptr) {
+    return LibXR::ErrorCode::INIT_ERR;
+  }
+  return active_manager->StartOnly(source);
+}
+
+LibXR::ErrorCode SyncSignalManager::StopRegisteredOutput(
+    SyncEventSource source) {
+  if (active_manager == nullptr) {
+    return LibXR::ErrorCode::INIT_ERR;
+  }
+  return active_manager->StopOnly(source);
 }
 
 void SyncSignalManager::RecordEventFromISR(SyncEventSource source,

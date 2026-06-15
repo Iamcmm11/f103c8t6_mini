@@ -1,5 +1,6 @@
 GPIO:
   PA15:
+    Pull: GPIO_PULLUP
     Signal: GPIO_Input
   PA4:
     Signal: GPIO_Output
@@ -7,13 +8,16 @@ GPIO:
     Signal: GPXTI6
     GPXTI: true
   PB3:
+    Pull: GPIO_PULLUP
     Signal: GPIO_Input
   PB4:
+    Pull: GPIO_PULLUP
     Signal: GPIO_Input
   PB8:
     Signal: GPXTI8
     GPXTI: true
   PC10:
+    Pull: GPIO_PULLUP
     Signal: GPIO_Input
 Peripherals:
   TIM:
@@ -21,6 +25,11 @@ Peripherals:
       Period: 9999
       Prescaler: 6399
       Channels:
+        CH2:
+          Label: TIM2
+          PWM: true
+          Complementary: false
+          DutyCycle: null
         CH3:
           Label: TIM2
           PWM: true
@@ -130,6 +139,13 @@ Peripherals:
       DMA_RX_TYPE: DMA
       DMA_TX: ENABLE
       DMA_TX_TYPE: DMA
+  CAN:
+    CAN2:
+      BaudRate: '250000'
+      TimeSeg1: CAN_BS1_13TQ
+      TimeSeg2: CAN_BS2_2TQ
+      AutoRetransmission: true
+      AutoWakeup: false
 DMA:
   Requests:
     '0': I2C1_RX

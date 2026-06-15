@@ -4,6 +4,7 @@ project(application)
 add_library(${PROJECT_NAME} STATIC)
 
 target_sources(${PROJECT_NAME} PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/feyman_canopen_task.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/imu_uart_bridge_task.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/yis_imu_acquisition_task.cpp
 )

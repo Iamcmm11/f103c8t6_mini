@@ -50,6 +50,9 @@ constexpr uint8_t kBridgeYISExtendedTimestampSize =
                          sizeof(uint64_t) + sizeof(uint8_t));
 constexpr uint8_t kBridgePoseRecordSize =
     static_cast<uint8_t>(1 + kBridgePoseFloatCount * sizeof(float));
+constexpr uint8_t kBridgeExtendedFloatCount = 13;
+constexpr uint8_t kBridgeExtendedRecordSize = static_cast<uint8_t>(
+    1 + kBridgeExtendedFloatCount * sizeof(float));
 constexpr uint8_t kBridgeWITPoseRecordSize = static_cast<uint8_t>(
     kBridgePoseRecordSize + kBridgeWITTimestampSize);
 constexpr uint8_t kBridgeYISPoseRecordSize = static_cast<uint8_t>(
@@ -95,6 +98,7 @@ constexpr uint32_t kTaskCreateOverheadBytes = 384;
 constexpr uint32_t kTaskCreateSafetyBytes = 256;
 constexpr size_t kYISBridgeQueueDepth = 32;
 constexpr uint8_t kYISBridgeAddress = 0x6A;
+constexpr uint8_t kFeymanBridgeAddress = 0x7F;
 constexpr float kGravityMps2 = 9.80665f;
 
 constexpr uint16_t BuildLeadingWITBridgeMask(uint8_t imu_count) {
@@ -153,6 +157,7 @@ IMUUartBridgeTask::IMUUartBridgeTask(UART* uart, I2C* i2c, SPI* spi,
       wit_subscriber_(nullptr),
       yis_queue_(nullptr),
       yis_queue_subscriber_(nullptr),
+      feyman_subscriber_(nullptr),
       gpio_button_queue_(8) {}
 
 ErrorCode IMUUartBridgeTask::Start() {
@@ -228,7 +233,6 @@ void IMUUartBridgeTask::RunStreamMode() {
   if (wit_subscriber_ == nullptr) {
     (void)WriteString("# imu_data topic unavailable\r\n");
   }
-
   while (running_) {
     if (wit_subscriber_ == nullptr) {
       Thread::Sleep(20);
@@ -271,7 +275,7 @@ void IMUUartBridgeTask::RunBridgeMode() {
         wit_subscriber_->StartWaiting();
         last_pose_push_ms_ = Thread::GetTime();
       }
-    } else {
+    } else if (config_.pose_source == BridgePoseSource::YIS) {
       auto topic = Topic::Find("yis_imu_pose");
       if (topic != nullptr) {
         yis_queue_ = new LockFreeQueue<Manager::YISPoseMsg>(kYISBridgeQueueDepth);
@@ -283,9 +287,18 @@ void IMUUartBridgeTask::RunBridgeMode() {
       if (yis_queue_subscriber_ != nullptr) {
         last_pose_push_ms_ = Thread::GetTime();
       }
+    } else {
+      auto topic = Topic::Find("feyman_imu_pose");
+      if (topic != nullptr) {
+        feyman_subscriber_ =
+            new Topic::ASyncSubscriber<Manager::FeymanPoseMsg>(Topic(topic));
+      }
+      if (feyman_subscriber_ != nullptr) {
+        feyman_subscriber_->StartWaiting();
+        last_pose_push_ms_ = Thread::GetTime();
+      }
     }
   }
-
   while (running_) {
     bool did_work = ProcessPendingCommand();
     const PublishResult gpio_result = PublishPendingGPIOButtonCommand();
@@ -317,6 +330,8 @@ void IMUUartBridgeTask::RunBridgeMode() {
   yis_queue_subscriber_ = nullptr;
   delete yis_queue_;
   yis_queue_ = nullptr;
+  delete feyman_subscriber_;
+  feyman_subscriber_ = nullptr;
 }
 
 IMUUartBridgeTask::PublishResult IMUUartBridgeTask::PublishPendingGPIOButtonCommand() {
@@ -531,54 +546,93 @@ IMUUartBridgeTask::PublishResult IMUUartBridgeTask::PublishBridgePoseData() {
     return result;
   }
 
-  if (yis_queue_ == nullptr) {
-    has_latest_yis_pose_ = false;
-    return PublishResult::NONE;
-  }
-
-  Manager::YISPoseMsg yis_msg;
-  bool got_new_yis_pose = false;
-  while (yis_queue_->Pop(yis_msg) == ErrorCode::OK) {
-    if (yis_msg.status == 0U) {
-      latest_yis_pose_ = yis_msg;
-      has_latest_yis_pose_ = true;
-      got_new_yis_pose = true;
+  if (config_.pose_source == BridgePoseSource::YIS) {
+    if (yis_queue_ == nullptr) {
+      has_latest_yis_pose_ = false;
+      return PublishResult::NONE;
     }
+
+    Manager::YISPoseMsg yis_msg;
+    bool got_new_yis_pose = false;
+    while (yis_queue_->Pop(yis_msg) == ErrorCode::OK) {
+      if (yis_msg.status == 0U) {
+        latest_yis_pose_ = yis_msg;
+        has_latest_yis_pose_ = true;
+        got_new_yis_pose = true;
+      }
+    }
+
+    if (!got_new_yis_pose) {
+      has_latest_yis_pose_ = false;
+      return PublishResult::NONE;
+    }
+
+    const Manager::YISPoseMsg& latest = latest_yis_pose_;
+    std::array<uint8_t, 1 + kBridgeYISExtendedPoseRecordSize> payload{};
+    payload[0] = 1;
+    payload[1] = kYISBridgeAddress;
+
+    uint16_t cursor = 2;
+    const std::array<float, kBridgePoseFloatCount> values = {
+        latest.euler[0],      latest.euler[1],      latest.euler[2],
+        latest.quaternion[0], latest.quaternion[1], latest.quaternion[2],
+        latest.quaternion[3]};
+    for (const float value : values) {
+      std::memcpy(payload.data() + cursor, &value, sizeof(float));
+      cursor = static_cast<uint16_t>(cursor + sizeof(float));
+    }
+    std::memcpy(payload.data() + cursor, &latest.sample_timestamp,
+                sizeof(latest.sample_timestamp));
+    cursor = static_cast<uint16_t>(cursor + sizeof(latest.sample_timestamp));
+    std::memcpy(payload.data() + cursor, &latest.sensor_mcu_tick_us,
+                sizeof(latest.sensor_mcu_tick_us));
+    cursor = static_cast<uint16_t>(cursor + sizeof(latest.sensor_mcu_tick_us));
+    std::memcpy(payload.data() + cursor, &latest.readout_mcu_tick_us,
+                sizeof(latest.readout_mcu_tick_us));
+    cursor = static_cast<uint16_t>(cursor + sizeof(latest.readout_mcu_tick_us));
+    payload[cursor++] = latest.time_status;
+
+    if (SendResponse(kBridgeCmdPosePush, payload.data(), cursor)) {
+      last_pose_push_ms_ = now_ms;
+      has_latest_yis_pose_ = false;
+      return PublishResult::SENT;
+    }
+
+    return PublishResult::BACKPRESSURE;
   }
 
-  if (!got_new_yis_pose) {
-    has_latest_yis_pose_ = false;
+  if (feyman_subscriber_ == nullptr || !feyman_subscriber_->Available()) {
+    has_latest_feyman_pose_ = false;
     return PublishResult::NONE;
   }
 
-  const Manager::YISPoseMsg& latest = latest_yis_pose_;
-  std::array<uint8_t, 1 + kBridgeYISExtendedPoseRecordSize> payload{};
+  const Manager::FeymanPoseMsg& latest = feyman_subscriber_->GetData();
+  latest_feyman_pose_ = latest;
+  has_latest_feyman_pose_ = (latest.status == 0U);
+  feyman_subscriber_->StartWaiting();
+
+  if (!has_latest_feyman_pose_) {
+    has_latest_feyman_pose_ = false;
+    return PublishResult::NONE;
+  }
+  std::array<uint8_t, 1 + kBridgeExtendedRecordSize> payload{};
   payload[0] = 1;
-  payload[1] = kYISBridgeAddress;
+  payload[1] = kFeymanBridgeAddress;
 
   uint16_t cursor = 2;
-  const std::array<float, kBridgePoseFloatCount> values = {
-      latest.euler[0],      latest.euler[1],      latest.euler[2],
-      latest.quaternion[0], latest.quaternion[1], latest.quaternion[2],
-      latest.quaternion[3]};
+  const float nan = std::numeric_limits<float>::quiet_NaN();
+  const std::array<float, kBridgeExtendedFloatCount> values = {
+      nan,          nan,          nan,          latest.acc[0],  latest.acc[1],
+      latest.acc[2], latest.gyro[0], latest.gyro[1], latest.gyro[2], nan,
+      nan,          nan,          nan};
   for (const float value : values) {
     std::memcpy(payload.data() + cursor, &value, sizeof(float));
     cursor = static_cast<uint16_t>(cursor + sizeof(float));
   }
-  std::memcpy(payload.data() + cursor, &latest.sample_timestamp,
-              sizeof(latest.sample_timestamp));
-  cursor = static_cast<uint16_t>(cursor + sizeof(latest.sample_timestamp));
-  std::memcpy(payload.data() + cursor, &latest.sensor_mcu_tick_us,
-              sizeof(latest.sensor_mcu_tick_us));
-  cursor = static_cast<uint16_t>(cursor + sizeof(latest.sensor_mcu_tick_us));
-  std::memcpy(payload.data() + cursor, &latest.readout_mcu_tick_us,
-              sizeof(latest.readout_mcu_tick_us));
-  cursor = static_cast<uint16_t>(cursor + sizeof(latest.readout_mcu_tick_us));
-  payload[cursor++] = latest.time_status;
 
   if (SendResponse(kBridgeCmdPosePush, payload.data(), cursor)) {
     last_pose_push_ms_ = now_ms;
-    has_latest_yis_pose_ = false;
+    has_latest_feyman_pose_ = false;
     return PublishResult::SENT;
   }
 
@@ -676,7 +730,12 @@ void IMUUartBridgeTask::ClearPendingPoseData() {
     while (yis_queue_->Pop(yis_msg) == ErrorCode::OK) {
     }
   }
+  if (feyman_subscriber_ != nullptr && feyman_subscriber_->Available()) {
+    (void)feyman_subscriber_->GetData();
+    feyman_subscriber_->StartWaiting();
+  }
   has_latest_yis_pose_ = false;
+  has_latest_feyman_pose_ = false;
 }
 
 bool IMUUartBridgeTask::WriteString(const char* str) {

@@ -24,6 +24,11 @@ USART:
     rx_buffer_size: 512
     dma_section: ''
     tx_queue_size: 5
+CAN:
+  CAN1:
+    queue_size: 5
+  CAN2:
+    queue_size: 5
 Terminal:
   read_buff_size: 32
   max_line_size: 32

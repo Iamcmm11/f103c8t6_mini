@@ -36,10 +36,14 @@ class SyncSignalManager {
   LibXR::ErrorCode RegisterPwmOutput(const SyncPwmOutputConfig& config);
   LibXR::ErrorCode StartAll();
   LibXR::ErrorCode StopAll();
+  LibXR::ErrorCode StartOnly(SyncEventSource source);
+  LibXR::ErrorCode StopOnly(SyncEventSource source);
   LibXR::ErrorCode GetLastStartResult(SyncEventSource source) const;
 
   static LibXR::ErrorCode StartRegisteredOutputs();
   static LibXR::ErrorCode StopRegisteredOutputs();
+  static LibXR::ErrorCode StartRegisteredOutput(SyncEventSource source);
+  static LibXR::ErrorCode StopRegisteredOutput(SyncEventSource source);
   static void RecordEventFromISR(SyncEventSource source, uint64_t mcu_tick_us);
   static void RecordEvent(SyncEventSource source, uint64_t mcu_tick_us);
   static bool GetLatestEvent(SyncEventSource source, SyncEventRecord& event);

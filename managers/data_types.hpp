@@ -64,6 +64,22 @@ struct YISPoseMsg {
   uint8_t reserved[2] = {0, 0};
 };
 
+struct FeymanPoseMsg {
+  uint64_t timestamp_us = 0;
+  uint64_t sensor_mcu_tick_us = 0;
+  uint64_t readout_mcu_tick_us = 0;
+  float euler[3] = {0.0f, 0.0f, 0.0f};
+  float quaternion[4] = {1.0f, 0.0f, 0.0f, 0.0f};
+  float acc[3] = {0.0f, 0.0f, 0.0f};
+  float gyro[3] = {0.0f, 0.0f, 0.0f};
+  uint32_t sample_timestamp = 0;
+  uint16_t status_flags = 0;
+  uint8_t status = 0;
+  uint8_t time_status = 0;
+  uint16_t sequence = 0;
+  uint16_t heartbeat_state = 0;
+};
+
 // 一帧 IMU 主题消息，包含时间戳、序号、有效位和全部槽位数据。
 struct IMUArrayMsg {
   uint64_t timestamp_us = 0;

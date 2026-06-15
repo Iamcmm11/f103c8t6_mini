@@ -25,6 +25,7 @@ using namespace LibXR;
 #include <cstdio>
 #include <cstring>
 
+#include "application/feyman_canopen_task.hpp"
 #include "application/imu_uart_bridge_task.hpp"
 #include "application/yis_imu_acquisition_task.hpp"
 #include "managers/gpio_manager.hpp"
@@ -104,6 +105,7 @@ void EnableTimUpdateInterrupt(void* context) {
 // NOLINTBEGIN
 // clang-format off
 /* External HAL Declarations */
+extern CAN_HandleTypeDef hcan2;
 extern I2C_HandleTypeDef hi2c1;
 extern SPI_HandleTypeDef hspi1;
 extern TIM_HandleTypeDef htim1;
@@ -141,18 +143,22 @@ extern "C" void app_main(void) {
   STM32GPIO PC10(GPIOC, GPIO_PIN_10);
 
 
+  STM32PWM pwm_tim2_ch2(&htim2, TIM_CHANNEL_2, false);
   STM32PWM pwm_tim2_ch3(&htim2, TIM_CHANNEL_3, false);
 
   STM32PWM pwm_tim5_ch1(&htim5, TIM_CHANNEL_1, false);
 
   STM32SPI spi1(&hspi1, {nullptr, 0}, spi1_tx_buf, 3);
 
-  // UART5 has no DMA in CubeMX; keep it for blocking boot logs only.
+  // STM32UART uart5(&huart5,
+  //             {nullptr, 0}, {nullptr, 0}, 5);
 
   STM32UART usart1(&huart1,
               usart1_rx_buf, usart1_tx_buf, 5);
 
   STM32I2C i2c1(&hi2c1, i2c1_buf, 3);
+
+  STM32CAN can2(&hcan2, 5);
 
   /* Terminal Configuration */
 
@@ -160,15 +166,6 @@ extern "C" void app_main(void) {
   // NOLINTEND
   /* User Code Begin 3 */
   char line[128] = {0};
-
-  (void)PA15.SetConfig(
-      {LibXR::GPIO::Direction::INPUT, LibXR::GPIO::Pull::UP});
-  (void)PB3.SetConfig(
-      {LibXR::GPIO::Direction::INPUT, LibXR::GPIO::Pull::UP});
-  (void)PB4.SetConfig(
-      {LibXR::GPIO::Direction::INPUT, LibXR::GPIO::Pull::UP});
-  (void)PC10.SetConfig(
-      {LibXR::GPIO::Direction::INPUT, LibXR::GPIO::Pull::UP});
 
   // ========================================================================
   // Create Manager / Module instances  创建设备管理
@@ -182,107 +179,25 @@ extern "C" void app_main(void) {
   static ::Manager::SyncSignalManager sync_signal_manager;
   static ::Module::YISIMU yis_imu(&i2c1, yis_i2c_addr);
 
-  // ========================================================================
-  // Initialize Manager / Module  设备管理初始化
-  // ========================================================================
-
-  constexpr uint16_t ws2812_led_count = 16;
-  const auto ws2812_ec =
-      ws2812_manager.Init(&ws2812_strip, 0, ws2812_led_count);
-  constexpr uint8_t ws2812_boot_red = 135;
-  constexpr uint8_t ws2812_boot_green = 206;
-  constexpr uint8_t ws2812_boot_blue = 250;
-  const auto ws2812_boot_ec =
-      (ws2812_ec == ErrorCode::OK)
-          ? ws2812_manager.SetLightControl(
-                ::Manager::WS2812Manager::kAllLedsTarget, ws2812_boot_red,
-                ws2812_boot_green, ws2812_boot_blue, false, 0U)
-          : ws2812_ec;
-
-  std::snprintf(line, sizeof(line), "[boot] ws2812 ec=%d leds=%u",
-                static_cast<int>(ws2812_ec),
-                static_cast<unsigned>(ws2812_led_count));
-  Uart5PrintLine(line);
-  std::snprintf(line, sizeof(line),
-                "[boot] ws2812 default=%d rgb=(%u,%u,%u)",
-                static_cast<int>(ws2812_boot_ec),
-                static_cast<unsigned>(ws2812_boot_red),
-                static_cast<unsigned>(ws2812_boot_green),
-                static_cast<unsigned>(ws2812_boot_blue));
-  Uart5PrintLine(line);
-
-  const auto imu_init_ec =
-      imu_manager.Init(&i2c1, ::Manager::kDefaultImuAddress);
-
-  std::snprintf(line, sizeof(line), "[boot] wit init=%d online=%u",
-                static_cast<int>(imu_init_ec),
-                static_cast<unsigned>(imu_manager.GetOnlineCount()));
-  Uart5PrintLine(line);
-
-// 同步信号管理器统一管理通用的 PWM 启动与事件记录流程。
-// 该钩子函数用于在本板级层中配置 STM32 定时器更新中断。
-  ::Manager::SyncPwmOutputConfig imu_sync_output;
-  imu_sync_output.source = ::Manager::SyncEventSource::TIM2_IMU_SYNC_1HZ;
-  imu_sync_output.pwm = &pwm_tim2_ch3;
-  imu_sync_output.nominal_period_us = 1000000U;
-  imu_sync_output.before_enable = EnableTimUpdateInterrupt;
-  imu_sync_output.context = &htim2;
-  (void)sync_signal_manager.RegisterPwmOutput(imu_sync_output);
-
-// 定时器 5 控制相机触发信号；定时器 2 输出 YIS 1 赫兹时间戳基准信号。
-  ::Manager::SyncPwmOutputConfig camera_trigger_output;
-  camera_trigger_output.source =
-      ::Manager::SyncEventSource::TIM5_CAMERA_TRIGGER_30HZ;
-  camera_trigger_output.pwm = &pwm_tim5_ch1;
-  camera_trigger_output.nominal_period_us = 33333U;
-  camera_trigger_output.before_enable = EnableTimUpdateInterrupt;
-  camera_trigger_output.context = &htim5;
-  (void)sync_signal_manager.RegisterPwmOutput(camera_trigger_output);
-
-  const uint32_t tim_clk_hz = GetTim5ClockHz();
-  const uint32_t tim2_psc = static_cast<uint32_t>(htim2.Init.Prescaler) + 1U;
-  const uint32_t tim2_arr = static_cast<uint32_t>(htim2.Init.Period) + 1U;
-  const uint32_t tim2_ccr = __HAL_TIM_GET_COMPARE(&htim2, TIM_CHANNEL_3);
-  const uint32_t sync_freq_hz =
-      (tim2_psc != 0U && tim2_arr != 0U) ? (tim_clk_hz / tim2_psc / tim2_arr)
-                                         : 0U;
-
-  std::snprintf(
-      line, sizeof(line),
-      "[boot] sync pwm registered clk=%lu psc=%lu arr=%lu ccr=%lu freq=%lu",
-      static_cast<unsigned long>(tim_clk_hz),
-      static_cast<unsigned long>(htim2.Init.Prescaler),
-      static_cast<unsigned long>(htim2.Init.Period),
-      static_cast<unsigned long>(tim2_ccr),
-      static_cast<unsigned long>(sync_freq_hz));
-  Uart5PrintLine(line);
-
-  const uint32_t tim5_psc = static_cast<uint32_t>(htim5.Init.Prescaler) + 1U;
-  const uint32_t tim5_arr = static_cast<uint32_t>(htim5.Init.Period) + 1U;
-  const uint32_t tim5_ccr = __HAL_TIM_GET_COMPARE(&htim5, TIM_CHANNEL_1);
-  const uint32_t camera_freq_hz =
-      (tim5_psc != 0U && tim5_arr != 0U) ? (tim_clk_hz / tim5_psc / tim5_arr)
-                                         : 0U;
-
-  std::snprintf(line, sizeof(line),
-                "[boot] camera pwm registered psc=%lu arr=%lu ccr=%lu freq=%lu",
-                static_cast<unsigned long>(htim5.Init.Prescaler),
-                static_cast<unsigned long>(htim5.Init.Period),
-                static_cast<unsigned long>(tim5_ccr),
-                static_cast<unsigned long>(camera_freq_hz));
-  Uart5PrintLine(line);
-
-  const auto yis_init_ec = yis_imu.Init();
-
-  std::snprintf(line, sizeof(line), "[boot] yis init=%d addr=0x%02X hal=0x%02X",
-                static_cast<int>(yis_init_ec),
-                static_cast<unsigned>(yis_imu.address()),
-                static_cast<unsigned>(yis_imu.slave_address()));
-  Uart5PrintLine(line);
 
   // ========================================================================
   // Create Application task instances (dedicated threads)  创建任务线程
   // ========================================================================
+
+  ::Application::FeymanCanopenConfig feyman_config;
+  feyman_config.node_id = 0x7F;
+  feyman_config.baudrate = 250000;
+  feyman_config.data_rate_hz = 100;
+  feyman_config.heartbeat_ms = 1000;
+  feyman_config.priority =
+      static_cast<uint32_t>(LibXR::Thread::Priority::HIGH);
+  feyman_config.stack_size = 2048;
+  feyman_config.sdo_timeout_ms = 200;
+  feyman_config.sdo_inter_request_delay_ms = 5;
+  feyman_config.work_mode_settle_ms = 50;
+  feyman_config.topic_name = "feyman_imu_pose";
+  feyman_config.log_writer = Uart5PrintLine;
+  static ::Application::FeymanCanopenTask feyman_task(&can2, feyman_config);
 
   // WIT acquisition config: 50Hz, topic "imu_data", high priority,
   // 2048-byte stack.
@@ -303,15 +218,16 @@ extern "C" void app_main(void) {
   yis_config.stack_size = 1536;
   yis_config.dr_wait_timeout_ms = 20;
   yis_config.topic_name = "yis_imu_pose";
-  static ::Application::YISIMUAcquisitionTask yis_task(&yis_imu, yis_config, &PB8);
+  static ::Application::YISIMUAcquisitionTask yis_task(&yis_imu, yis_config,
+                                                       &PB8);
 
-  // Bridge config: 20ms push period, medium priority, 1536-byte stack.
-  // Select bridge pose source here: WIT or YIS.
+  // Bridge config: data-driven push, medium priority, 1536-byte stack.
+  // Select bridge pose source here: WIT, YIS, or FEYMAN.
   ::Application::IMUUartBridgeConfig bridge_config;
   bridge_config.stream_relative_euler = false;    //字符流输出
   bridge_config.push_imu_euler_in_bridge = true;  //是否主动向 UART 推送姿态数据
   bridge_config.push_sync_events_in_bridge = true; //是否主动向 UART 推送 TIM2/TIM5 同步事件
-  bridge_config.pose_source = ::Application::BridgePoseSource::YIS;
+  bridge_config.pose_source = ::Application::BridgePoseSource::FEYMAN; //桥接数据来源选择，WIT、YIS 或 FEYMAN
   bridge_config.push_all_slots_in_bridge = false; //WIT 多 IMU 推送时，是否把无效槽位也打包进去
   bridge_config.wit_push_imu_count = wit_acq_config.enabled_imu_count;
   bridge_config.stream_interval_ms = 0;   //桥接推送频率不再设置为50hz或者200hz，根据底层数据输出频率决定，上层不加限制
@@ -320,22 +236,118 @@ extern "C" void app_main(void) {
   static ::Application::IMUUartBridgeTask imu_bridge(
       &usart1, &i2c1, &spi1, &imu_manager, &ws2812_manager, bridge_config);
 
+  // ========================================================================
+  // Initialize Manager / Module  设备管理初始化
+  // ========================================================================
+
+  constexpr uint16_t ws2812_led_count = 16;
+  const auto ws2812_ec =
+      ws2812_manager.Init(&ws2812_strip, 0, ws2812_led_count);
+  constexpr uint8_t ws2812_boot_red = 135;
+  constexpr uint8_t ws2812_boot_green = 206;
+  constexpr uint8_t ws2812_boot_blue = 250;
+  const auto ws2812_boot_ec = (ws2812_ec == ErrorCode::OK) ? ws2812_manager.SetLightControl(
+                ::Manager::WS2812Manager::kAllLedsTarget, ws2812_boot_red,
+                ws2812_boot_green, ws2812_boot_blue, false, 0U)
+          : ws2812_ec;
+
+  const auto imu_init_ec = imu_manager.Init(&i2c1, ::Manager::kDefaultImuAddress);
+
+// 同步信号管理器统一管理通用的 PWM 启动与事件记录流程。
+// 该钩子函数用于在本板级层中配置 STM32 定时器更新中断。
+  ::Manager::SyncPwmOutputConfig imu_sync_output;
+  imu_sync_output.source = ::Manager::SyncEventSource::TIM2_IMU_SYNC_1HZ;
+  imu_sync_output.pwm = &pwm_tim2_ch2;
+  imu_sync_output.nominal_period_us = 1000000U;
+  imu_sync_output.before_enable = EnableTimUpdateInterrupt;
+  imu_sync_output.context = &htim2;
+  (void)sync_signal_manager.RegisterPwmOutput(imu_sync_output);
+
+// 定时器 5 控制相机触发信号；定时器 2 输出 YIS 1 赫兹时间戳基准信号。
+  ::Manager::SyncPwmOutputConfig camera_trigger_output;
+  camera_trigger_output.source = ::Manager::SyncEventSource::TIM5_CAMERA_TRIGGER_30HZ;
+  camera_trigger_output.pwm = &pwm_tim5_ch1;
+  camera_trigger_output.nominal_period_us = 33333U;
+  camera_trigger_output.before_enable = EnableTimUpdateInterrupt;
+  camera_trigger_output.context = &htim5;
+  (void)sync_signal_manager.RegisterPwmOutput(camera_trigger_output);
+
+  const uint32_t tim_clk_hz = GetTim5ClockHz();
+  const uint32_t tim2_psc = static_cast<uint32_t>(htim2.Init.Prescaler) + 1U;
+  const uint32_t tim2_arr = static_cast<uint32_t>(htim2.Init.Period) + 1U;
+  const uint32_t tim2_ccr = __HAL_TIM_GET_COMPARE(&htim2, TIM_CHANNEL_2);
+  const uint32_t sync_freq_hz =(tim2_psc != 0U && tim2_arr != 0U) ? (tim_clk_hz / tim2_psc / tim2_arr): 0U;
+
+  const uint32_t tim5_psc = static_cast<uint32_t>(htim5.Init.Prescaler) + 1U;
+  const uint32_t tim5_arr = static_cast<uint32_t>(htim5.Init.Period) + 1U;
+  const uint32_t tim5_ccr = __HAL_TIM_GET_COMPARE(&htim5, TIM_CHANNEL_1);
+  const uint32_t camera_freq_hz =(tim5_psc != 0U && tim5_arr != 0U) ? (tim_clk_hz / tim5_psc / tim5_arr): 0U;
+
+  const auto yis_init_ec = yis_imu.Init();
+
   const ::Manager::GPIOButtonCommand button_commands[] = {
       {&PC10, 'A'},
       {&PA15, 'B'},
       {&PB3, 'C'},
       {&PB4, 'D'},
   };
+
   ::Manager::GPIOManagerConfig gpio_config;
-  gpio_config.command_callback =
-      ::Application::IMUUartBridgeTask::PublishGPIOButtonCommandCallback;
+  gpio_config.command_callback = ::Application::IMUUartBridgeTask::PublishGPIOButtonCommandCallback;
   gpio_config.command_context = &imu_bridge;
   gpio_config.commands = button_commands;
-  gpio_config.command_count =
-      sizeof(button_commands) / sizeof(button_commands[0]);
+  gpio_config.command_count = sizeof(button_commands) / sizeof(button_commands[0]);
   gpio_config.stack_size = 1024;
   const auto gpio_init_ec = gpio_manager.Init(gpio_config);
 
+  std::snprintf(line, sizeof(line), "[boot] ws2812 ec=%d leds=%u",
+                static_cast<int>(ws2812_ec),
+                static_cast<unsigned>(ws2812_led_count));
+  Uart5PrintLine(line);
+  std::snprintf(line, sizeof(line),
+                "[boot] ws2812 default=%d rgb=(%u,%u,%u)",
+                static_cast<int>(ws2812_boot_ec),
+                static_cast<unsigned>(ws2812_boot_red),
+                static_cast<unsigned>(ws2812_boot_green),
+                static_cast<unsigned>(ws2812_boot_blue));
+  Uart5PrintLine(line);
+
+
+    std::snprintf(line, sizeof(line), "[boot] ws2812 ec=%d leds=%u",
+                static_cast<int>(ws2812_ec),
+                static_cast<unsigned>(ws2812_led_count));
+  Uart5PrintLine(line);
+  std::snprintf(line, sizeof(line),
+                "[boot] ws2812 default=%d rgb=(%u,%u,%u)",
+                static_cast<int>(ws2812_boot_ec),
+                static_cast<unsigned>(ws2812_boot_red),
+                static_cast<unsigned>(ws2812_boot_green),
+                static_cast<unsigned>(ws2812_boot_blue));
+  Uart5PrintLine(line);
+
+    std::snprintf(
+      line, sizeof(line),
+      "[boot] sync pwm registered clk=%lu psc=%lu arr=%lu ccr=%lu freq=%lu",
+      static_cast<unsigned long>(tim_clk_hz),
+      static_cast<unsigned long>(htim2.Init.Prescaler),
+      static_cast<unsigned long>(htim2.Init.Period),
+      static_cast<unsigned long>(tim2_ccr),
+      static_cast<unsigned long>(sync_freq_hz));
+  Uart5PrintLine(line);
+
+    std::snprintf(line, sizeof(line),
+                "[boot] camera pwm registered psc=%lu arr=%lu ccr=%lu freq=%lu",
+                static_cast<unsigned long>(htim5.Init.Prescaler),
+                static_cast<unsigned long>(htim5.Init.Period),
+                static_cast<unsigned long>(tim5_ccr),
+                static_cast<unsigned long>(camera_freq_hz));
+  Uart5PrintLine(line);
+
+    std::snprintf(line, sizeof(line), "[boot] yis init=%d addr=0x%02X hal=0x%02X",
+                static_cast<int>(yis_init_ec),
+                static_cast<unsigned>(yis_imu.address()),
+                static_cast<unsigned>(yis_imu.slave_address()));
+  Uart5PrintLine(line);
   // ========================================================================
   // Start Application threads  启动任务线程
   // ========================================================================
@@ -352,6 +364,7 @@ extern "C" void app_main(void) {
   if (yis_init_ec == ErrorCode::OK) {
     yis_start_ec = yis_task.Start();
   }
+  const auto feyman_start_ec = feyman_task.Start();
 
   // 启动串口桥收发任务
   const auto bridge_start_ec = imu_bridge.Start();
@@ -359,6 +372,11 @@ extern "C" void app_main(void) {
       (gpio_init_ec == ErrorCode::OK && bridge_start_ec == ErrorCode::OK)
           ? gpio_manager.Start()
           : ((gpio_init_ec != ErrorCode::OK) ? gpio_init_ec : bridge_start_ec);
+
+  std::snprintf(line, sizeof(line),
+                "[boot] feyman start=%d node=0x%02X rate=%lu sync=deferred",
+                static_cast<int>(feyman_start_ec), 0x7FU, 20UL);
+  Uart5PrintLine(line);
 
   std::snprintf(line, sizeof(line), "[boot] wit start=%d freq=%lu stack=%lu",
                 static_cast<int>(imu_acq_ec),

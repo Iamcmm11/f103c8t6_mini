@@ -3,16 +3,17 @@
 Host-side tool for the STM32 UART bridge.
 
 Run from repo root with utils/python path:
-  python utils/python/imu_uart_bridge_test.py --port COM13 ping
-  python utils/python/imu_uart_bridge_test.py --port COM13 start
-  python utils/python/imu_uart_bridge_test.py --port COM13 stop
-  python utils/python/imu_uart_bridge_test.py --port COM13 rgb 135 206 250
-  python utils/python/imu_uart_bridge_test.py --port COM13 led 3 255 0 0
-  python utils/python/imu_uart_bridge_test.py --port COM13 off
+  python utils/python/imu_uart_bridge_test.py --port COM14 ping
+  python utils/python/imu_uart_bridge_test.py --port COM14 start
+  python utils/python/imu_uart_bridge_test.py --port COM14 stop
+  python utils/python/imu_uart_bridge_test.py --port COM14 rgb 135 206 250
+  python utils/python/imu_uart_bridge_test.py --port COM14 led 3 255 0 0
+  python utils/python/imu_uart_bridge_test.py --port COM14 off
   python utils/python/imu_uart_bridge_test.py --port COM13 blink 135 206 250 --delay-ms 300
   python utils/python/imu_uart_bridge_test.py --port COM13 led-blink 3 255 0 0 --delay-ms 300
   python utils/python/imu_uart_bridge_test.py --port COM13 console
   python utils/python/imu_uart_bridge_test.py --port COM13 --baud 460800 sync-monitor
+  python utils/python/imu_uart_bridge_test.py --port COM14 rate-monitor --addr 0x7F --expected-hz 250
 Run from repo root with scripts path:
   python scripts/imu_uart_bridge_test.py --port /dev/ttyTHS1 ping
   python scripts/imu_uart_bridge_test.py --port /dev/ttyTHS1 start
@@ -278,6 +279,124 @@ class SyncCycleStats:
 class RXMetadata:
     rx_wall_us: int
     rx_monotonic_ns: int
+    cmd: int = 0
+    payload_len: int = 0
+    frame_len: int = 0
+
+
+@dataclass
+class AddressRateStats:
+    imu_addr: int
+    record_count: int = 0
+    first_ns: Optional[int] = None
+    last_ns: Optional[int] = None
+    prev_ns: Optional[int] = None
+    step_sum_ns: int = 0
+    step_count: int = 0
+    step_min_ns: Optional[int] = None
+    step_max_ns: Optional[int] = None
+
+    def update(self, rx_monotonic_ns: int) -> None:
+        if self.first_ns is None:
+            self.first_ns = rx_monotonic_ns
+        if self.prev_ns is not None:
+            step_ns = rx_monotonic_ns - self.prev_ns
+            self.step_sum_ns += step_ns
+            self.step_count += 1
+            if self.step_min_ns is None or step_ns < self.step_min_ns:
+                self.step_min_ns = step_ns
+            if self.step_max_ns is None or step_ns > self.step_max_ns:
+                self.step_max_ns = step_ns
+        self.record_count += 1
+        self.prev_ns = rx_monotonic_ns
+        self.last_ns = rx_monotonic_ns
+
+    def elapsed_s(self) -> float:
+        if self.first_ns is None or self.last_ns is None:
+            return 0.0
+        return max(0.0, (self.last_ns - self.first_ns) / 1_000_000_000.0)
+
+    def record_hz(self) -> float:
+        elapsed = self.elapsed_s()
+        if elapsed <= 0.0:
+            return 0.0
+        return self.record_count / elapsed
+
+    def avg_step_ms(self) -> float:
+        if self.step_count == 0:
+            return 0.0
+        return self.step_sum_ns / self.step_count / 1_000_000.0
+
+    def min_step_ms(self) -> Optional[float]:
+        if self.step_min_ns is None:
+            return None
+        return self.step_min_ns / 1_000_000.0
+
+    def max_step_ms(self) -> Optional[float]:
+        if self.step_max_ns is None:
+            return None
+        return self.step_max_ns / 1_000_000.0
+
+
+@dataclass
+class RateMonitorStats:
+    start_ns: Optional[int] = None
+    last_ns: Optional[int] = None
+    bundle_count: int = 0
+    record_count: int = 0
+    payload_bytes: int = 0
+    frame_bytes: int = 0
+    per_addr: dict[int, AddressRateStats] = None  # type: ignore[assignment]
+
+    def __post_init__(self) -> None:
+        if self.per_addr is None:
+            self.per_addr = {}
+
+    def update(
+        self,
+        imu_records: list[IMUPushRecord],
+        rx_meta: RXMetadata,
+        addr_filter: Optional[int] = None,
+    ) -> None:
+        selected = [
+            record
+            for record in imu_records
+            if addr_filter is None or record.imu_addr == addr_filter
+        ]
+        if not selected:
+            return
+
+        if self.start_ns is None:
+            self.start_ns = rx_meta.rx_monotonic_ns
+        self.last_ns = rx_meta.rx_monotonic_ns
+        self.bundle_count += 1
+        self.record_count += len(selected)
+        self.payload_bytes += rx_meta.payload_len
+        self.frame_bytes += rx_meta.frame_len
+
+        for record in selected:
+            state = self.per_addr.get(record.imu_addr)
+            if state is None:
+                state = AddressRateStats(imu_addr=record.imu_addr)
+                self.per_addr[record.imu_addr] = state
+            state.update(rx_meta.rx_monotonic_ns)
+
+    def elapsed_s(self) -> float:
+        if self.start_ns is None or self.last_ns is None:
+            return 0.0
+        return max(0.0, (self.last_ns - self.start_ns) / 1_000_000_000.0)
+
+    def bundle_hz(self) -> float:
+        elapsed = self.elapsed_s()
+        if elapsed <= 0.0:
+            return 0.0
+        return self.bundle_count / elapsed
+
+    def record_hz(self) -> float:
+        elapsed = self.elapsed_s()
+        if elapsed <= 0.0:
+            return 0.0
+        return self.record_count / elapsed
 
 
 @dataclass(frozen=True)
@@ -888,6 +1007,9 @@ class BridgeClient:
             return resp, RXMetadata(
                 rx_wall_us=time.time_ns() // 1000,
                 rx_monotonic_ns=time.monotonic_ns(),
+                cmd=cmd,
+                payload_len=len(resp),
+                frame_len=len(resp) + 6,
             )
 
     def _read_exact(self, size: int, timeout: Optional[float] = None) -> Optional[bytes]:
@@ -979,6 +1101,9 @@ class BridgeClient:
             rx_meta = RXMetadata(
                 rx_wall_us=time.time_ns() // 1000,
                 rx_monotonic_ns=time.monotonic_ns(),
+                cmd=cmd,
+                payload_len=payload_len,
+                frame_len=total_len,
             )
             frame = bytes(rx_buf[:total_len])
             del rx_buf[:total_len]
@@ -1873,6 +1998,125 @@ def cmd_sync_monitor(client: BridgeClient, _args: argparse.Namespace) -> int:
             print(f"stream-control stop warning: {exc}", file=sys.stderr, flush=True)
 
 
+def _format_rate_line(
+    stats: RateMonitorStats,
+    *,
+    label: str,
+) -> str:
+    elapsed_s = stats.elapsed_s()
+    payload_bps = stats.payload_bytes / elapsed_s if elapsed_s > 0.0 else 0.0
+    frame_bps = stats.frame_bytes / elapsed_s if elapsed_s > 0.0 else 0.0
+    return (
+        f"{label},"
+        f"elapsed_s,{elapsed_s:.3f},"
+        f"bundles,{stats.bundle_count},"
+        f"bundle_hz,{stats.bundle_hz():.2f},"
+        f"records,{stats.record_count},"
+        f"record_hz,{stats.record_hz():.2f},"
+        f"payload_B,{stats.payload_bytes},"
+        f"payload_Bps,{payload_bps:.1f},"
+        f"frame_B,{stats.frame_bytes},"
+        f"frame_Bps,{frame_bps:.1f}"
+    )
+
+
+def _format_addr_rate_line(
+    state: AddressRateStats,
+    *,
+    expected_hz: float,
+) -> str:
+    expected_part = ""
+    if expected_hz > 0.0:
+        ratio = state.record_hz() / expected_hz * 100.0
+        expected_part = f",expected_hz,{expected_hz:.2f},ratio,{ratio:.1f}%"
+    return (
+        f"rate_addr,addr,0x{state.imu_addr:02X},"
+        f"records,{state.record_count},"
+        f"record_hz,{state.record_hz():.2f},"
+        f"host_step_avg_ms,{state.avg_step_ms():.3f},"
+        f"host_step_min_ms,{state.min_step_ms()},"
+        f"host_step_max_ms,{state.max_step_ms()}"
+        f"{expected_part}"
+    )
+
+
+def _print_rate_summary(
+    stats: RateMonitorStats,
+    *,
+    label: str,
+    expected_hz: float,
+) -> None:
+    print(_format_rate_line(stats, label=label), flush=True)
+    for addr in sorted(stats.per_addr):
+        print(
+            _format_addr_rate_line(
+                stats.per_addr[addr],
+                expected_hz=expected_hz,
+            ),
+            flush=True,
+        )
+
+
+def cmd_rate_monitor(client: BridgeClient, args: argparse.Namespace) -> int:
+    active = send_stream_start(client, args)
+    addr_text = "all" if args.addr is None else f"0x{args.addr:02X}"
+    print(
+        "Rate-monitor started: "
+        f"active={int(active)}, addr={addr_text}, "
+        f"duration_s={args.duration_s}, print_interval_s={args.print_interval_s}. "
+        "Press Ctrl+C to stop.",
+        flush=True,
+    )
+
+    stats = RateMonitorStats()
+    lock = threading.Lock()
+    stop_time = (
+        time.monotonic() + args.duration_s if args.duration_s > 0.0 else None
+    )
+    next_print = time.monotonic() + args.print_interval_s
+
+    def _record(
+        _ts_unix_ms: int,
+        imu_records: list[IMUPushRecord],
+        rx_meta: RXMetadata,
+    ) -> None:
+        with lock:
+            stats.update(imu_records, rx_meta, addr_filter=args.addr)
+
+    client.set_imu_record_callback(_record)
+    try:
+        while True:
+            now = time.monotonic()
+            if stop_time is not None and now >= stop_time:
+                break
+            if args.print_interval_s > 0.0 and now >= next_print:
+                with lock:
+                    _print_rate_summary(
+                        stats,
+                        label="rate",
+                        expected_hz=args.expected_hz,
+                    )
+                next_print = now + args.print_interval_s
+            time.sleep(0.05)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        client.set_imu_record_callback(None)
+        with lock:
+            _print_rate_summary(
+                stats,
+                label="rate_final",
+                expected_hz=args.expected_hz,
+            )
+        try:
+            active = send_stream_stop(client, args)
+            print(f"stream-control stop ok: active={int(active)}", flush=True)
+        except Exception as exc:
+            print(f"stream-control stop warning: {exc}", file=sys.stderr, flush=True)
+
+    return 0
+
+
 def cmd_sync(client: BridgeClient, args: argparse.Namespace) -> int:
     samples: list[TimeSyncSample] = []
     error_count = 0
@@ -2184,6 +2428,36 @@ def build_parser() -> argparse.ArgumentParser:
     )
     monitor_parser.set_defaults(func=cmd_monitor)
 
+    rate_monitor_parser = subparsers.add_parser(
+        "rate-monitor",
+        help="measure IMU push rate and UART data volume",
+    )
+    rate_monitor_parser.add_argument(
+        "--duration-s",
+        type=float,
+        default=10.0,
+        help="measurement duration in seconds; <=0 runs until Ctrl+C",
+    )
+    rate_monitor_parser.add_argument(
+        "--print-interval-s",
+        type=float,
+        default=1.0,
+        help="periodic summary interval in seconds; <=0 prints final only",
+    )
+    rate_monitor_parser.add_argument(
+        "--addr",
+        type=parse_byte,
+        default=None,
+        help="optional IMU address filter, e.g. 0x7F for FEYMAN",
+    )
+    rate_monitor_parser.add_argument(
+        "--expected-hz",
+        type=float,
+        default=0.0,
+        help="expected record rate for ratio display, e.g. 250",
+    )
+    rate_monitor_parser.set_defaults(func=cmd_rate_monitor)
+
     sync_monitor_parser = subparsers.add_parser(
         "sync-monitor",
         help="analyze sample_timestamp reset cycles for externally synchronized YIS data",
@@ -2254,7 +2528,12 @@ def main() -> int:
     args = parser.parse_args()
 
     try:
-        print_imu = args.command not in {"capture", "sync", "sync-monitor"}
+        print_imu = args.command not in {
+            "capture",
+            "rate-monitor",
+            "sync",
+            "sync-monitor",
+        }
         with BridgeClient(
             args.port,
             args.baud,
