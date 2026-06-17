@@ -364,10 +364,14 @@ extern "C" void app_main(void) {
   if (yis_init_ec == ErrorCode::OK) {
     yis_start_ec = yis_task.Start();
   }
+
+  // 启动FEYMAN采集任务
   const auto feyman_start_ec = feyman_task.Start();
 
   // 启动串口桥收发任务
   const auto bridge_start_ec = imu_bridge.Start();
+  
+   // 启动按键桥发任务
   const auto gpio_start_ec =
       (gpio_init_ec == ErrorCode::OK && bridge_start_ec == ErrorCode::OK)
           ? gpio_manager.Start()
@@ -375,7 +379,9 @@ extern "C" void app_main(void) {
 
   std::snprintf(line, sizeof(line),
                 "[boot] feyman start=%d node=0x%02X rate=%lu sync=deferred",
-                static_cast<int>(feyman_start_ec), 0x7FU, 20UL);
+                static_cast<int>(feyman_start_ec),
+                static_cast<unsigned>(feyman_config.node_id),
+                static_cast<unsigned long>(feyman_config.data_rate_hz));
   Uart5PrintLine(line);
 
   std::snprintf(line, sizeof(line), "[boot] wit start=%d freq=%lu stack=%lu",
