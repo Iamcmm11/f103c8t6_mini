@@ -11,24 +11,29 @@
 
 namespace {
 
+// 创建 FreeRTOS/LibXR 线程时，除用户指定栈外还需要预留一部分堆空间。
 constexpr uint32_t kTaskCreateOverheadBytes = 384;
 constexpr uint32_t kTaskCreateSafetyBytes = 256;
 
+// CANopen 标准 COB-ID 基址；实际帧 ID = 基址 + 节点 ID。
 constexpr uint32_t kSdoReqIdBase = 0x600;
 constexpr uint32_t kSdoRespIdBase = 0x580;
 constexpr uint32_t kHeartbeatIdBase = 0x700;
 constexpr uint32_t kTpdoIdBase[] = {0x180, 0x280};
 
+// NMT 网络管理命令：启动节点、进入预操作、复位通信。
 constexpr uint8_t kNmtStartRemoteNode = 0x01;
 constexpr uint8_t kNmtEnterPreOperational = 0x80;
 constexpr uint8_t kNmtResetCommunication = 0x82;
 
+// expedited SDO 命令字：读 4 字节、写 1/2/4 字节、abort 响应。
 constexpr uint8_t kSdoRead4Byte = 0x40;
 constexpr uint8_t kSdoWrite1Byte = 0x2F;
 constexpr uint8_t kSdoWrite2Byte = 0x2B;
 constexpr uint8_t kSdoWrite4Byte = 0x23;
 constexpr uint8_t kSdoAbort = 0x80;
 
+// FEYMAN CANopen 对象字典索引。
 constexpr uint16_t kObjProducerHeartbeat = 0x1017;
 constexpr uint16_t kObjTpdoCommBase = 0x1800;
 constexpr uint16_t kObjTpdoMapBase = 0x1A00;
@@ -38,13 +43,16 @@ constexpr uint16_t kObjDataFrequency = 0x3006;
 constexpr uint16_t kObjWorkMode = 0x300B;
 constexpr uint16_t kObjJ1939Enable = 0x300D;
 
+// 设备工作模式：启用 CANopen，关闭 J1939。
 constexpr uint8_t kWorkModeCanopen = 0x02;
 constexpr uint8_t kJ1939Disabled = 0x00;
 
+// 本地 PDO 有效位与时间同步状态位。
 constexpr uint8_t kPdoValidAccel = 0x01;
 constexpr uint8_t kPdoValidGyro = 0x02;
 constexpr uint8_t kFeymanTimeStatusHasEpoch = 0x01;
 
+// FEYMAN 原始量程换算系数：加速度 raw -> g，角速度 raw -> deg/s。
 constexpr float kAccelScaleG = 8.0f / 32000.0f;
 constexpr float kGyroScale = 500.0f / 32000.0f;
 constexpr float kGravityMps2 = 9.80665f;
@@ -52,6 +60,7 @@ constexpr float kGravityMps2 = 9.80665f;
 using LibXR::CAN;
 using LibXR::ErrorCode;
 
+/// 将 1/2/4 字节数值按小端序写入 SDO payload 数据区。
 template <typename T>
 void WriteLe(std::array<uint8_t, 4>& dst, T value) {
   static_assert(sizeof(T) <= 4, "payload too large");
@@ -59,6 +68,7 @@ void WriteLe(std::array<uint8_t, 4>& dst, T value) {
   std::memcpy(dst.data(), &value, sizeof(T));
 }
 
+/// 从 PDO payload 中读取小端 int16 原始值。
 int16_t ReadI16Le(const uint8_t* data) {
   int16_t value = 0;
   std::memcpy(&value, data, sizeof(value));
@@ -69,10 +79,12 @@ int16_t ReadI16Le(const uint8_t* data) {
 
 namespace Application {
 
+/// 保存外部 CAN 指针和配置；真正的资源分配在 Start 中完成。
 FeymanCanopenTask::FeymanCanopenTask(LibXR::CAN* can,
                                      const FeymanCanopenConfig& config)
     : can_(can), config_(config) {}
 
+/// 启动 FEYMAN CANopen 任务：检查参数、创建 topic、注册 CAN 回调并创建线程。
 ErrorCode FeymanCanopenTask::Start() {
   if (running_) {
     return ErrorCode::BUSY;
@@ -102,6 +114,7 @@ ErrorCode FeymanCanopenTask::Start() {
   running_ = true;
   device_configured_ = false;
   pdo_state_ = PdoState{};
+  pending_pdo_mask_ = 0U;
   sdo_transaction_ = SdoTransaction{};
   pending_can_error_ = PendingCanError{};
   while (sdo_sem_.Wait(0U) == ErrorCode::OK) {
@@ -117,6 +130,7 @@ ErrorCode FeymanCanopenTask::Start() {
   return ErrorCode::OK;
 }
 
+/// 请求任务退出，并唤醒可能正在等待 SDO 响应的线程。
 void FeymanCanopenTask::Stop() {
   if (!running_) {
     return;
@@ -126,12 +140,14 @@ void FeymanCanopenTask::Stop() {
   LibXR::Thread::Sleep(config_.sdo_timeout_ms + 10U);
 }
 
+/// LibXR 线程入口，转发到对象的 Run 方法。
 void FeymanCanopenTask::TaskEntry(FeymanCanopenTask* task) {
   if (task != nullptr) {
     task->Run();
   }
 }
 
+/// CAN 驱动回调入口，转发到对象的帧处理方法。
 void FeymanCanopenTask::OnCanFrame(bool in_isr, FeymanCanopenTask* task,
                                    const LibXR::CAN::ClassicPack& pack) {
   if (task != nullptr) {
@@ -139,6 +155,7 @@ void FeymanCanopenTask::OnCanFrame(bool in_isr, FeymanCanopenTask* task,
   }
 }
 
+/// 任务主循环：上电等待、配置设备，然后持续发布数据并输出延迟日志。
 void FeymanCanopenTask::Run() {
   Logf("[feyman] start node=0x%02X baud=%lu rate=%lu", config_.node_id,
        static_cast<unsigned long>(config_.baudrate),
@@ -160,6 +177,7 @@ void FeymanCanopenTask::Run() {
   }
 }
 
+/// 按 CAN 帧 ID 和类型分发到 SDO、heartbeat、TPDO 或错误处理。
 void FeymanCanopenTask::HandleCanFrame(bool in_isr,
                                        const LibXR::CAN::ClassicPack& pack) {
   UNUSED(in_isr);
@@ -189,6 +207,7 @@ void FeymanCanopenTask::HandleCanFrame(bool in_isr,
   }
 }
 
+/// CAN 错误可能来自中断上下文，仅记录摘要，实际打印放到任务线程。
 void FeymanCanopenTask::HandleCanError(const LibXR::CAN::ClassicPack& pack) {
   const UBaseType_t interrupt_mask = taskENTER_CRITICAL_FROM_ISR();
   pending_can_error_.pending = true;
@@ -200,6 +219,7 @@ void FeymanCanopenTask::HandleCanError(const LibXR::CAN::ClassicPack& pack) {
   taskEXIT_CRITICAL_FROM_ISR(interrupt_mask);
 }
 
+/// 解析 SDO 响应帧，并唤醒正在 WaitSdoResponse 的任务线程。
 void FeymanCanopenTask::HandleSdoResponse(const LibXR::CAN::ClassicPack& pack) {
   if (pack.dlc < 8U) {
     return;
@@ -235,6 +255,7 @@ void FeymanCanopenTask::HandleSdoResponse(const LibXR::CAN::ClassicPack& pack) {
   }
 }
 
+/// 记录 heartbeat 中的 CANopen 节点状态和接收时间。
 void FeymanCanopenTask::HandleHeartbeat(const LibXR::CAN::ClassicPack& pack) {
   if (pack.dlc == 0U) {
     return;
@@ -246,9 +267,11 @@ void FeymanCanopenTask::HandleHeartbeat(const LibXR::CAN::ClassicPack& pack) {
   taskEXIT_CRITICAL_FROM_ISR(interrupt_mask);
 }
 
+/// 解析 TPDO1/TPDO2 的三轴 int16 数据，并更新本地 PDO 快照。
 void FeymanCanopenTask::HandlePdo(PdoKind kind,
                                   const LibXR::CAN::ClassicPack& pack) {
   const UBaseType_t interrupt_mask = taskENTER_CRITICAL_FROM_ISR();
+  uint8_t received_mask = 0U;
   switch (kind) {
     case PdoKind::TPDO1_ACCEL:
       if (pack.dlc < 6U) {
@@ -259,6 +282,7 @@ void FeymanCanopenTask::HandlePdo(PdoKind kind,
       pdo_state_.acc_raw[1] = ReadI16Le(pack.data + 2);
       pdo_state_.acc_raw[2] = ReadI16Le(pack.data + 4);
       pdo_state_.valid_mask = static_cast<uint8_t>(pdo_state_.valid_mask | kPdoValidAccel);
+      received_mask = kPdoValidAccel;
       break;
     case PdoKind::TPDO2_GYRO:
       if (pack.dlc < 6U) {
@@ -269,14 +293,22 @@ void FeymanCanopenTask::HandlePdo(PdoKind kind,
       pdo_state_.gyro_raw[1] = ReadI16Le(pack.data + 2);
       pdo_state_.gyro_raw[2] = ReadI16Le(pack.data + 4);
       pdo_state_.valid_mask = static_cast<uint8_t>(pdo_state_.valid_mask | kPdoValidGyro);
+      received_mask = kPdoValidGyro;
       break;
   }
 
-  pdo_state_.latest_pdo_tick_us = LibXR::Timebase::GetMicroseconds();
-  ++pdo_state_.sequence;
+  pending_pdo_mask_ = static_cast<uint8_t>(pending_pdo_mask_ | received_mask);
+  const uint8_t required_mask =
+      static_cast<uint8_t>(kPdoValidAccel | kPdoValidGyro);
+  if ((pending_pdo_mask_ & required_mask) == required_mask) {
+    pdo_state_.latest_pdo_tick_us = LibXR::Timebase::GetMicroseconds();
+    ++pdo_state_.sequence;
+    pending_pdo_mask_ = 0U;
+  }
   taskEXIT_CRITICAL_FROM_ISR(interrupt_mask);
 }
 
+/// 当加速度和角速度都已收到且数据更新时，发布 FeymanPoseMsg 到 topic。
 void FeymanCanopenTask::PublishPoseIfReady() {
   if (!device_configured_) {
     return;
@@ -299,6 +331,7 @@ void FeymanCanopenTask::PublishPoseIfReady() {
   msg.timestamp_us = LibXR::Timebase::GetMicroseconds();
   msg.readout_mcu_tick_us =
       Manager::SyncSignalManager::ToSessionTickUs(msg.timestamp_us);
+  // 当前 TPDO 只映射加速度和角速度，姿态角与四元数暂用 NaN 表示不可用。
   msg.euler[0] = std::numeric_limits<float>::quiet_NaN();
   msg.euler[1] = std::numeric_limits<float>::quiet_NaN();
   msg.euler[2] = std::numeric_limits<float>::quiet_NaN();
@@ -332,6 +365,7 @@ void FeymanCanopenTask::PublishPoseIfReady() {
   last_publish_tick_us_ = snapshot.latest_pdo_tick_us;
 }
 
+/// 在普通任务上下文中输出 CAN 错误摘要，避免回调/中断里阻塞打印。
 void FeymanCanopenTask::FlushPendingCanErrorLog() {
   PendingCanError error{};
   taskENTER_CRITICAL();
@@ -359,6 +393,7 @@ void FeymanCanopenTask::FlushPendingCanErrorLog() {
   }
 }
 
+/// 完整配置 FEYMAN：进入预操作、写基础参数、配置 TPDO、复位通信并启动节点。
 ErrorCode FeymanCanopenTask::ConfigureDevice() {
   LogConfig("[feyman] configure begin");
   LogConfig("[feyman] nmt pre-op");
@@ -374,6 +409,7 @@ ErrorCode FeymanCanopenTask::ConfigureDevice() {
     return ec;
   }
 
+  // CANopen PDO 映射格式：index(16bit) + subindex(8bit) + bit length(8bit)。
   const uint32_t accel_map[] = {0x40010110U, 0x40010210U, 0x40010310U};
   const uint32_t gyro_map[] = {0x40020110U, 0x40020210U, 0x40020310U};
 
@@ -406,6 +442,7 @@ ErrorCode FeymanCanopenTask::ConfigureDevice() {
   return SendNmt(kNmtStartRemoteNode);
 }
 
+/// 配置设备基础对象字典参数，并读取关键参数用于日志确认。
 ErrorCode FeymanCanopenTask::ConfigureBasicParameters() {
   LogConfig("[feyman] basic params");
 
@@ -465,6 +502,7 @@ ErrorCode FeymanCanopenTask::ConfigureBasicParameters() {
   return ErrorCode::OK;
 }
 
+/// 配置指定 TPDO 的通信参数、映射项和事件触发周期。
 ErrorCode FeymanCanopenTask::ConfigureTpdo(uint8_t pdo_index, uint16_t cob_id,
                                            uint8_t map_count,
                                            const uint32_t* mappings) {
@@ -512,11 +550,13 @@ ErrorCode FeymanCanopenTask::ConfigureTpdo(uint8_t pdo_index, uint16_t cob_id,
   return SdoWriteU32(comm_index, 0x01U, static_cast<uint32_t>(cob_id));
 }
 
+/// 发送 NMT 命令到当前节点。
 ErrorCode FeymanCanopenTask::SendNmt(uint8_t command) {
   const uint8_t payload[2] = {command, config_.node_id};
   return SendCanFrame(0x000U, payload, 2U, CAN::Type::STANDARD);
 }
 
+/// 通过 expedited SDO 读取 32 位无符号值。
 ErrorCode FeymanCanopenTask::SdoReadU32(uint16_t index, uint8_t subindex,
                                         uint32_t* value_out) {
   if (value_out == nullptr) {
@@ -536,6 +576,7 @@ ErrorCode FeymanCanopenTask::SdoReadU32(uint16_t index, uint8_t subindex,
   return ErrorCode::OK;
 }
 
+/// 通过 expedited SDO 写入 8 位无符号值。
 ErrorCode FeymanCanopenTask::SdoWriteU8(uint16_t index, uint8_t subindex,
                                         uint8_t value) {
   std::array<uint8_t, 4> data{};
@@ -548,6 +589,7 @@ ErrorCode FeymanCanopenTask::SdoWriteU8(uint16_t index, uint8_t subindex,
   return WaitSdoResponse(index, subindex, response);
 }
 
+/// 通过 expedited SDO 写入 16 位无符号值。
 ErrorCode FeymanCanopenTask::SdoWriteU16(uint16_t index, uint8_t subindex,
                                          uint16_t value) {
   std::array<uint8_t, 4> data{};
@@ -560,6 +602,7 @@ ErrorCode FeymanCanopenTask::SdoWriteU16(uint16_t index, uint8_t subindex,
   return WaitSdoResponse(index, subindex, response);
 }
 
+/// 通过 expedited SDO 写入 32 位无符号值。
 ErrorCode FeymanCanopenTask::SdoWriteU32(uint16_t index, uint8_t subindex,
                                          uint32_t value) {
   std::array<uint8_t, 4> data{};
@@ -572,6 +615,7 @@ ErrorCode FeymanCanopenTask::SdoWriteU32(uint16_t index, uint8_t subindex,
   return WaitSdoResponse(index, subindex, response);
 }
 
+/// 组装 SDO 请求帧，登记待匹配事务，然后发送到 0x600 + node_id。
 ErrorCode FeymanCanopenTask::SendSdoRequest(
     uint8_t command, uint16_t index, uint8_t subindex,
     const std::array<uint8_t, 4>& data) {
@@ -596,6 +640,7 @@ ErrorCode FeymanCanopenTask::SendSdoRequest(
                       CAN::Type::STANDARD);
 }
 
+/// 等待 SDO 响应；超时或 abort 时返回错误并输出诊断日志。
 ErrorCode FeymanCanopenTask::WaitSdoResponse(uint16_t index, uint8_t subindex,
                                              SdoResponse& response) {
   const ErrorCode ec = sdo_sem_.Wait(config_.sdo_timeout_ms);
@@ -620,12 +665,14 @@ ErrorCode FeymanCanopenTask::WaitSdoResponse(uint16_t index, uint8_t subindex,
   return ErrorCode::OK;
 }
 
+/// 根据配置给设备留出连续 SDO 请求之间的处理时间。
 void FeymanCanopenTask::DelayBetweenSdoRequests() {
   if (config_.sdo_inter_request_delay_ms != 0U) {
     LibXR::Thread::Sleep(config_.sdo_inter_request_delay_ms);
   }
 }
 
+/// 构造 LibXR Classic CAN 帧并提交给 CAN 驱动发送队列。
 ErrorCode FeymanCanopenTask::SendCanFrame(uint32_t id, const uint8_t* data,
                                           uint8_t dlc, CAN::Type type) {
   if (data == nullptr || dlc > 8U) {
@@ -639,18 +686,21 @@ ErrorCode FeymanCanopenTask::SendCanFrame(uint32_t id, const uint8_t* data,
   return can_->AddMessage(pack);
 }
 
+/// 输出一行普通日志；未配置 log_writer 时静默忽略。
 void FeymanCanopenTask::Log(const char* text) {
   if (config_.log_writer != nullptr && text != nullptr) {
     config_.log_writer(text);
   }
 }
 
+/// verbose_config_log 开启时输出配置流程日志。
 void FeymanCanopenTask::LogConfig(const char* text) {
   if (config_.verbose_config_log) {
     Log(text);
   }
 }
 
+/// 带格式化的一行普通日志输出。
 void FeymanCanopenTask::Logf(const char* fmt, ...) {
   if (config_.log_writer == nullptr || fmt == nullptr) {
     return;
@@ -663,6 +713,7 @@ void FeymanCanopenTask::Logf(const char* fmt, ...) {
   config_.log_writer(line);
 }
 
+/// verbose_config_log 开启时输出带格式化的配置日志。
 void FeymanCanopenTask::LogConfigf(const char* fmt, ...) {
   if (!config_.verbose_config_log || config_.log_writer == nullptr ||
       fmt == nullptr) {
@@ -676,6 +727,7 @@ void FeymanCanopenTask::LogConfigf(const char* fmt, ...) {
   config_.log_writer(line);
 }
 
+/// 读取 CAN 控制器错误计数/状态并输出，常用于 SDO 超时诊断。
 void FeymanCanopenTask::LogCanErrorState(const char* context) {
   if (can_ == nullptr) {
     return;
@@ -698,10 +750,12 @@ void FeymanCanopenTask::LogCanErrorState(const char* context) {
        static_cast<unsigned>(state.error_warning));
 }
 
+/// FEYMAN 加速度原始值换算：raw -> g -> m/s^2。
 float FeymanCanopenTask::DecodeAccelMps2(int16_t raw) {
   return static_cast<float>(raw) * kAccelScaleG * kGravityMps2;
 }
 
+/// FEYMAN 角速度原始值换算：raw -> deg/s。
 float FeymanCanopenTask::DecodeGyroDps(int16_t raw) {
   return static_cast<float>(raw) * kGyroScale;
 }
