@@ -11,6 +11,9 @@
 namespace Application {
 
 struct FeymanCanopenConfig {
+  // 设备当前上电时的节点号，用于建立初始通信。
+  uint8_t connect_node_id = 0x7F;
+  // 设备最终希望配置成的节点号；不改地址时与 connect_node_id 保持一致。
   uint8_t node_id = 0x7F;
   uint32_t baudrate = 250000;
   uint32_t data_rate_hz = 20;

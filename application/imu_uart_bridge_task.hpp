@@ -117,7 +117,7 @@ class IMUUartBridgeTask {
   LibXR::Topic::ASyncSubscriber<Manager::IMUArrayMsg>* wit_subscriber_;
   LibXR::LockFreeQueue<Manager::YISPoseMsg>* yis_queue_;
   LibXR::Topic::QueuedSubscriber* yis_queue_subscriber_;
-  LibXR::Topic::ASyncSubscriber<Manager::FeymanPoseMsg>* feyman_subscriber_;
+  LibXR::Topic::ASyncSubscriber<Manager::FeymanArrayMsg>* feyman_subscriber_;
   LibXR::LockFreeQueue<uint8_t> gpio_button_queue_;
   CommandParserState command_parser_state_ = CommandParserState::WAIT_SOF0;
   std::array<uint8_t, kCommandPayloadBufferSize> command_payload_{};
@@ -129,8 +129,6 @@ class IMUUartBridgeTask {
   bool has_pending_gpio_button_command_ = false;
   Manager::YISPoseMsg latest_yis_pose_{};
   bool has_latest_yis_pose_ = false;
-  Manager::FeymanPoseMsg latest_feyman_pose_{};
-  bool has_latest_feyman_pose_ = false;
   std::array<Manager::SyncEventRecord, 8> pending_sync_events_{};
   uint8_t pending_sync_event_count_ = 0;
 };

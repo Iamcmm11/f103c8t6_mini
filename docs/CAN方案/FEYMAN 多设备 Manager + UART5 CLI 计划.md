@@ -1,0 +1,112 @@
+# FEYMAN 多设备 Manager + UART5 CLI 计划
+
+## Summary
+- 目标：把 FEYMAN 从“单设备 task”升级成“多设备 manager”，并提供一个**UART5 文本 CLI**做现场运维；`USART1` 继续保留现有二进制桥协议，不在 v1 里承担设备管理入口。
+- 范围：v1 只管理 **FEYMAN IMU**，不立即泛化到所有 CAN 设备；数据消费以**聚合 topic**为主键 `node_id`，同时保留一个单设备兼容壳，避免现有 FEYMAN bridge 直接断掉。
+- 生命周期：运行期按 **静态设备名单** 工作；CLI 负责 **扫描、查看状态、改单机地址**。改地址流程默认要求“总线上只接待改那一只旧地址设备”。
+
+## Key Changes
+- 新增 `Manager::FeymanManager` 作为 FEYMAN 多设备入口：
+  - 位置：`managers/`
+  - 职责：单 CAN 回调分发、设备表管理、顺序配置多节点、聚合发布、地址改写编排、统一错误状态与在线状态管理。
+  - 线程模型：**一个 manager 工作线程 + 一个 CAN 总线回调**，不为每台 FEYMAN 再起独立任务线程。
+- 保留 `Module::FeymanMCS10` 作为底层 BSP/协议单元，但调整边界：
+  - 继续负责单设备 CANopen 对象字典、SDO/NMT、TPDO 解码、单设备状态机。
+  - 去掉“自己拥有整条总线生命周期”的假设，改成可被 manager 驱动。
+  - manager 拥有总线订阅权；模块实例只处理“属于自己 node_id 的帧”和自己的配置事务。
+- 新增 UART5 文本 CLI：
+  - 位置：建议 `application/` 下单独一个 `UART5CliTask`
+  - 入口：`UART5`，115200，面向人手敲运维
+  - 与现有日志共口，但所有 CLI 输出与日志都统一加前缀并串行写，避免字节交错。
+  - v1 命令集固定为：
+    - `help`
+    - `feyman list`
+    - `feyman scan`
+    - `feyman scan <start> <end>`
+    - `feyman status <node>`
+    - `feyman readdr <current> <target>`
+    - `feyman start`
+    - `feyman stop`
+  - `feyman readdr` 行为固定：
+    - 用 `<current>` 作为当前连接地址
+    - 写 `0x3004` 为 `<target>`
+    - 发送广播 `NMT reset/start`
+    - 打印“请断电重上并改静态名单”的明确提示
+    - 若扫描结果显示总线上同一旧地址不止一台，则拒绝执行
+- 多设备数据模型与兼容策略：
+  - 新增聚合 topic，例如 `feyman_imu_array`
+  - 聚合消息按 `node_id` 标识设备，不用槽位或角色名
+  - 聚合消息建议固定上限 `MAX_FEYMAN_DEVICE_COUNT = 8`
+  - 每条设备记录至少包含：
+    - `node_id`
+    - `online/configured` 状态
+    - 最近一次 `timestamp_us / sensor_mcu_tick_us / readout_mcu_tick_us`
+    - `acc[3] / gyro[3]`
+    - `status_flags / heartbeat_state / sequence / status`
+  - 为兼容现有 bridge，保留一个 `primary_node_id` 概念：
+    - manager 额外发布一个单设备兼容 topic `feyman_imu_pose`
+    - 内容来自 `primary_node_id`
+    - 这样 `BridgePoseSource::FEYMAN` 现阶段不必立刻重写
+- 配置与 app_main：
+  - `app_main` 改为创建 `FeymanManager`，提供静态设备名单
+  - 静态名单 v1 结构固定为：
+    - `node_id`
+    - `enabled`
+  - 不在静态名单里存“旧地址 -> 新地址”迁移信息；地址迁移完全走 CLI 临时操作
+  - `FeymanCanopenTask` 保留为兼容壳：
+    - 内部退化为调用 `FeymanManager` 的单设备模式
+    - 只为旧路径/旧 topic 兼容，不再作为多设备主入口
+
+## Public Interfaces
+- 新增 `Manager::FeymanManagerConfig`
+  - `LibXR::CAN* can`
+  - `const FeymanManagedDeviceConfig* devices`
+  - `size_t device_count`
+  - `uint8_t primary_node_id`
+  - `const char* aggregate_topic_name`
+  - `const char* legacy_topic_name`
+  - `uint32_t priority`
+  - `uint32_t stack_size`
+  - `void (*log_writer)(const char*)`
+- 新增 `Manager::FeymanManagedDeviceConfig`
+  - `uint8_t node_id`
+  - `bool enabled`
+- 新增聚合消息类型，例如 `Manager::FeymanArrayMsg`
+  - 固定容量 `MAX_FEYMAN_DEVICE_COUNT = 8`
+  - 记录数组按“有效条目数 + 设备记录”组织
+- 新增 manager API
+  - `Init(const FeymanManagerConfig&)`
+  - `Start()`
+  - `Stop()`
+  - `RequestScan(uint8_t start = 1, uint8_t end = 127)`
+  - `RequestReaddress(uint8_t current_node_id, uint8_t target_node_id)`
+  - `GetSnapshot(...)` 或等价只读接口，供 CLI 打印状态
+- `USART1` 二进制桥协议 v1 不新增管理命令；设备管理只走 UART5 CLI
+
+## Test Plan
+- 构建：
+  - `cmake --build build\Debug` 通过
+  - 验证新增 `managers`、`application`、`modules` 依赖无循环
+- 单设备兼容：
+  - 单台 FEYMAN 正常启动
+  - `primary_node_id` 的 `feyman_imu_pose` 仍能驱动现有 FEYMAN bridge
+- 多设备运行：
+  - 两台不同 `node_id` 的 FEYMAN 同时在线
+  - manager 顺序完成配置
+  - `feyman_imu_array` 连续发布两台设备数据，按 `node_id` 可区分
+- CLI：
+  - `feyman list` 能看到静态名单状态
+  - `feyman scan` 能发现在线节点
+  - `feyman status <node>` 能输出在线/配置/最近采样状态
+  - `feyman readdr 0x7F 0x7E` 在单设备接入时成功
+  - 改址后断电重上，静态名单切到新地址后可正常启动
+  - 若同旧地址设备不止一台，`readdr` 明确拒绝
+- 错误回归：
+  - CAN 错误日志只输出一次，不因多模块重复注册而放大
+  - ISR 路径仍只用 callback-safe semaphore/API
+
+## Assumptions
+- v1 只做 FEYMAN IMU manager，不抽象成通用 CAN manager。
+- UART5 可以承担“文本 CLI + 诊断日志”双角色；为避免混杂，实现里统一做串口写串行化。
+- 地址改写是**运维动作**，不是常规启动动作；默认要求单机隔离执行。
+- 聚合 topic 是后续正式消费面；单设备 `feyman_imu_pose` 只是兼容层，后续可在 bridge 完成升级后再移除。

@@ -25,15 +25,15 @@ using namespace LibXR;
 #include <cstdio>
 #include <cstring>
 
-#include "application/feyman_canopen_task.hpp"
 #include "application/imu_uart_bridge_task.hpp"
 #include "application/yis_imu_acquisition_task.hpp"
+#include "managers/feyman_manager.hpp"
 #include "managers/gpio_manager.hpp"
 #include "managers/imu_manager.hpp"
 #include "managers/sync_signal_manager.hpp"
 #include "managers/ws2812_manager.hpp"
-#include "modules/yesense_yis_imu/yis_imu.hpp"
 #include "modules/ws2812/ws2812_strip.hpp"
+#include "modules/yesense_yis_imu/yis_imu.hpp"
 
 extern UART_HandleTypeDef huart5;
 
@@ -55,15 +55,10 @@ extern "C" void app_on_tim6_period_elapsed(void) {
 
 namespace {
 
-constexpr bool kEnableUart5LogPush = true;  //开启关闭串口5的阻塞形式的日志输出
+constexpr bool kEnableUart5LogPush = true;
 
 void Uart5Print(const char* text) {
-  if (!kEnableUart5LogPush) {
-    (void)text;
-    return;
-  }
-
-  if (text == nullptr) {
+  if (!kEnableUart5LogPush || text == nullptr) {
     return;
   }
 
@@ -174,30 +169,45 @@ extern "C" void app_main(void) {
   constexpr uint8_t yis_i2c_addr = 0x6A;
   static ::Module::WS2812Strip ws2812_strip(&spi1);
   static ::Manager::WS2812Manager ws2812_manager;
+  static ::Manager::FeymanManager feyman_manager;
   static ::Manager::IMUManager imu_manager(::Manager::ACTUAL_IMU_COUNT);
   static ::Manager::GPIOManager gpio_manager;
   static ::Manager::SyncSignalManager sync_signal_manager;
   static ::Module::YISIMU yis_imu(&i2c1, yis_i2c_addr);
-
+  static ::Manager::FeymanManagedDeviceConfig feyman_devices[] = {
+      {0x7E, true},
+      {0x7F, true},
+  };
 
   // ========================================================================
   // Create Application task instances (dedicated threads)  创建任务线程
   // ========================================================================
 
-  ::Application::FeymanCanopenConfig feyman_config;
-  feyman_config.node_id = 0x7F;
+  // 正常运行：静态设备表里直接写最终 node_id。
+  // 单机改址：临时只保留一台设备，并把它的 node_id 改成目标地址；
+  // 设备对象内部仍按 connect_node_id -> node_id 的配置式流程完成改址，
+  // 改完后断电重上，再把静态表改回新的最终地址。
+  ::Manager::FeymanManagerConfig feyman_config;
+  feyman_config.can = &can2;
+  feyman_config.devices = feyman_devices;
+  feyman_config.device_count =
+      sizeof(feyman_devices) / sizeof(feyman_devices[0]);
+  feyman_config.primary_node_id = 0x7E;
+  feyman_config.aggregate_topic_name = "feyman_imu_array";
+  feyman_config.legacy_topic_name = "feyman_imu_pose";
+  feyman_config.priority =
+      static_cast<uint32_t>(LibXR::Thread::Priority::HIGH);
+  feyman_config.stack_size = 3072;
+  feyman_config.startup_delay_ms = 50;
   feyman_config.baudrate = 250000;
   feyman_config.data_rate_hz = 100;
   feyman_config.heartbeat_ms = 1000;
-  feyman_config.priority =
-      static_cast<uint32_t>(LibXR::Thread::Priority::HIGH);
-  feyman_config.stack_size = 2048;
   feyman_config.sdo_timeout_ms = 200;
   feyman_config.sdo_inter_request_delay_ms = 5;
   feyman_config.work_mode_settle_ms = 50;
-  feyman_config.topic_name = "feyman_imu_pose";
+  feyman_config.verbose_config_log = true;
   feyman_config.log_writer = Uart5PrintLine;
-  static ::Application::FeymanCanopenTask feyman_task(&can2, feyman_config);
+
 
   // WIT acquisition config: 50Hz, topic "imu_data", high priority,
   // 2048-byte stack.
@@ -218,8 +228,7 @@ extern "C" void app_main(void) {
   yis_config.stack_size = 1536;
   yis_config.dr_wait_timeout_ms = 20;
   yis_config.topic_name = "yis_imu_pose";
-  static ::Application::YISIMUAcquisitionTask yis_task(&yis_imu, yis_config,
-                                                       &PB8);
+  static ::Application::YISIMUAcquisitionTask yis_task(&yis_imu, yis_config,&PB8);
 
   // Bridge config: data-driven push, medium priority, 1536-byte stack.
   // Select bridge pose source here: WIT, YIS, or FEYMAN.
@@ -236,22 +245,23 @@ extern "C" void app_main(void) {
   static ::Application::IMUUartBridgeTask imu_bridge(
       &usart1, &i2c1, &spi1, &imu_manager, &ws2812_manager, bridge_config);
 
-  // ========================================================================
-  // Initialize Manager / Module  设备管理初始化
-  // ========================================================================
-
   constexpr uint16_t ws2812_led_count = 16;
   const auto ws2812_ec =
       ws2812_manager.Init(&ws2812_strip, 0, ws2812_led_count);
   constexpr uint8_t ws2812_boot_red = 135;
   constexpr uint8_t ws2812_boot_green = 206;
   constexpr uint8_t ws2812_boot_blue = 250;
-  const auto ws2812_boot_ec = (ws2812_ec == ErrorCode::OK) ? ws2812_manager.SetLightControl(
+  const auto ws2812_boot_ec =
+      (ws2812_ec == ErrorCode::OK)
+          ? ws2812_manager.SetLightControl(
                 ::Manager::WS2812Manager::kAllLedsTarget, ws2812_boot_red,
                 ws2812_boot_green, ws2812_boot_blue, false, 0U)
           : ws2812_ec;
 
-  const auto imu_init_ec = imu_manager.Init(&i2c1, ::Manager::kDefaultImuAddress);
+  const auto imu_init_ec =
+      imu_manager.Init(&i2c1, ::Manager::kDefaultImuAddress);
+  const auto yis_init_ec = yis_imu.Init();
+  const auto feyman_init_ec = feyman_manager.Init(feyman_config);
 
 // 同步信号管理器统一管理通用的 PWM 启动与事件记录流程。
 // 该钩子函数用于在本板级层中配置 STM32 定时器更新中断。
@@ -263,9 +273,16 @@ extern "C" void app_main(void) {
   imu_sync_output.context = &htim2;
   (void)sync_signal_manager.RegisterPwmOutput(imu_sync_output);
 
+  ::Manager::SyncPwmOutputConfig imu_sync_pb10_output = imu_sync_output;
+  imu_sync_pb10_output.pwm = &pwm_tim2_ch3;
+  imu_sync_pb10_output.before_enable = nullptr;
+  imu_sync_pb10_output.context = nullptr;
+  (void)sync_signal_manager.RegisterPwmOutput(imu_sync_pb10_output);
+
 // 定时器 5 控制相机触发信号；定时器 2 输出 YIS 1 赫兹时间戳基准信号。
   ::Manager::SyncPwmOutputConfig camera_trigger_output;
-  camera_trigger_output.source = ::Manager::SyncEventSource::TIM5_CAMERA_TRIGGER_30HZ;
+  camera_trigger_output.source =
+      ::Manager::SyncEventSource::TIM5_CAMERA_TRIGGER_30HZ;
   camera_trigger_output.pwm = &pwm_tim5_ch1;
   camera_trigger_output.nominal_period_us = 33333U;
   camera_trigger_output.before_enable = EnableTimUpdateInterrupt;
@@ -273,17 +290,21 @@ extern "C" void app_main(void) {
   (void)sync_signal_manager.RegisterPwmOutput(camera_trigger_output);
 
   const uint32_t tim_clk_hz = GetTim5ClockHz();
-  const uint32_t tim2_psc = static_cast<uint32_t>(htim2.Init.Prescaler) + 1U;
+  const uint32_t tim2_psc =
+      static_cast<uint32_t>(htim2.Init.Prescaler) + 1U;
   const uint32_t tim2_arr = static_cast<uint32_t>(htim2.Init.Period) + 1U;
   const uint32_t tim2_ccr = __HAL_TIM_GET_COMPARE(&htim2, TIM_CHANNEL_2);
-  const uint32_t sync_freq_hz =(tim2_psc != 0U && tim2_arr != 0U) ? (tim_clk_hz / tim2_psc / tim2_arr): 0U;
+  const uint32_t sync_freq_hz =
+      (tim2_psc != 0U && tim2_arr != 0U) ? (tim_clk_hz / tim2_psc / tim2_arr)
+                                         : 0U;
 
-  const uint32_t tim5_psc = static_cast<uint32_t>(htim5.Init.Prescaler) + 1U;
+  const uint32_t tim5_psc =
+      static_cast<uint32_t>(htim5.Init.Prescaler) + 1U;
   const uint32_t tim5_arr = static_cast<uint32_t>(htim5.Init.Period) + 1U;
   const uint32_t tim5_ccr = __HAL_TIM_GET_COMPARE(&htim5, TIM_CHANNEL_1);
-  const uint32_t camera_freq_hz =(tim5_psc != 0U && tim5_arr != 0U) ? (tim_clk_hz / tim5_psc / tim5_arr): 0U;
-
-  const auto yis_init_ec = yis_imu.Init();
+  const uint32_t camera_freq_hz =
+      (tim5_psc != 0U && tim5_arr != 0U) ? (tim_clk_hz / tim5_psc / tim5_arr)
+                                         : 0U;
 
   const ::Manager::GPIOButtonCommand button_commands[] = {
       {&PC10, 'A'},
@@ -311,39 +332,23 @@ extern "C" void app_main(void) {
                 static_cast<unsigned>(ws2812_boot_green),
                 static_cast<unsigned>(ws2812_boot_blue));
   Uart5PrintLine(line);
-
-
-    std::snprintf(line, sizeof(line), "[boot] ws2812 ec=%d leds=%u",
-                static_cast<int>(ws2812_ec),
-                static_cast<unsigned>(ws2812_led_count));
+  std::snprintf(line, sizeof(line),
+                "[boot] sync pwm registered clk=%lu psc=%lu arr=%lu ccr=%lu freq=%lu",
+                static_cast<unsigned long>(tim_clk_hz),
+                static_cast<unsigned long>(htim2.Init.Prescaler),
+                static_cast<unsigned long>(htim2.Init.Period),
+                static_cast<unsigned long>(tim2_ccr),
+                static_cast<unsigned long>(sync_freq_hz));
   Uart5PrintLine(line);
   std::snprintf(line, sizeof(line),
-                "[boot] ws2812 default=%d rgb=(%u,%u,%u)",
-                static_cast<int>(ws2812_boot_ec),
-                static_cast<unsigned>(ws2812_boot_red),
-                static_cast<unsigned>(ws2812_boot_green),
-                static_cast<unsigned>(ws2812_boot_blue));
-  Uart5PrintLine(line);
-
-    std::snprintf(
-      line, sizeof(line),
-      "[boot] sync pwm registered clk=%lu psc=%lu arr=%lu ccr=%lu freq=%lu",
-      static_cast<unsigned long>(tim_clk_hz),
-      static_cast<unsigned long>(htim2.Init.Prescaler),
-      static_cast<unsigned long>(htim2.Init.Period),
-      static_cast<unsigned long>(tim2_ccr),
-      static_cast<unsigned long>(sync_freq_hz));
-  Uart5PrintLine(line);
-
-    std::snprintf(line, sizeof(line),
                 "[boot] camera pwm registered psc=%lu arr=%lu ccr=%lu freq=%lu",
                 static_cast<unsigned long>(htim5.Init.Prescaler),
                 static_cast<unsigned long>(htim5.Init.Period),
                 static_cast<unsigned long>(tim5_ccr),
                 static_cast<unsigned long>(camera_freq_hz));
   Uart5PrintLine(line);
-
-    std::snprintf(line, sizeof(line), "[boot] yis init=%d addr=0x%02X hal=0x%02X",
+  std::snprintf(line, sizeof(line),
+                "[boot] yis init=%d addr=0x%02X hal=0x%02X",
                 static_cast<int>(yis_init_ec),
                 static_cast<unsigned>(yis_imu.address()),
                 static_cast<unsigned>(yis_imu.slave_address()));
@@ -365,12 +370,13 @@ extern "C" void app_main(void) {
     yis_start_ec = yis_task.Start();
   }
 
-  // 启动FEYMAN采集任务
-  const auto feyman_start_ec = feyman_task.Start();
+  const auto feyman_start_ec =
+      (feyman_init_ec == ErrorCode::OK) ? feyman_manager.Start()
+                                        : feyman_init_ec;
 
   // 启动串口桥收发任务
   const auto bridge_start_ec = imu_bridge.Start();
-  
+
    // 启动按键桥发任务
   const auto gpio_start_ec =
       (gpio_init_ec == ErrorCode::OK && bridge_start_ec == ErrorCode::OK)
@@ -378,30 +384,27 @@ extern "C" void app_main(void) {
           : ((gpio_init_ec != ErrorCode::OK) ? gpio_init_ec : bridge_start_ec);
 
   std::snprintf(line, sizeof(line),
-                "[boot] feyman start=%d node=0x%02X rate=%lu sync=deferred",
+                "[boot] feyman mgr init=%d start=%d devices=%u primary=0x%02X",
+                static_cast<int>(feyman_init_ec),
                 static_cast<int>(feyman_start_ec),
-                static_cast<unsigned>(feyman_config.node_id),
-                static_cast<unsigned long>(feyman_config.data_rate_hz));
+                static_cast<unsigned>(feyman_config.device_count),
+                static_cast<unsigned>(feyman_config.primary_node_id));
   Uart5PrintLine(line);
-
   std::snprintf(line, sizeof(line), "[boot] wit start=%d freq=%lu stack=%lu",
                 static_cast<int>(imu_acq_ec),
                 static_cast<unsigned long>(wit_acq_config.frequency_hz),
                 static_cast<unsigned long>(wit_acq_config.stack_size));
   Uart5PrintLine(line);
-
   std::snprintf(line, sizeof(line), "[boot] yis start=%d freq=%lu stack=%lu",
                 static_cast<int>(yis_start_ec),
                 static_cast<unsigned long>(yis_config.frequency_hz),
                 static_cast<unsigned long>(yis_config.stack_size));
   Uart5PrintLine(line);
-
   std::snprintf(line, sizeof(line), "[boot] bridge start=%d push=%u period=%lu",
                 static_cast<int>(bridge_start_ec),
                 static_cast<unsigned>(bridge_config.push_imu_euler_in_bridge),
                 static_cast<unsigned long>(bridge_config.stream_interval_ms));
   Uart5PrintLine(line);
-
   std::snprintf(line, sizeof(line),
                 "[boot] gpio init=%d start=%d PC10=A PA15=B PB3=C PB4=D",
                 static_cast<int>(gpio_init_ec),

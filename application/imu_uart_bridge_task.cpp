@@ -77,9 +77,16 @@ constexpr uint16_t kBridgeWITMaxPayload = static_cast<uint16_t>(
     kBridgeIMUPushIndexes.size() * kBridgeWITCompactRecordSize);
 constexpr uint16_t kBridgeYISMaxPayload =
     static_cast<uint16_t>(1 + kBridgeYISExtendedPoseRecordSize);
+constexpr uint16_t kBridgeFeymanMaxPayload = static_cast<uint16_t>(
+    1 + Manager::MAX_FEYMAN_DEVICE_COUNT * kBridgeExtendedRecordSize);
 constexpr uint16_t kBridgePoseMaxPayload =
-    (kBridgeWITMaxPayload > kBridgeYISMaxPayload) ? kBridgeWITMaxPayload
-                                                  : kBridgeYISMaxPayload;
+    (kBridgeWITMaxPayload > kBridgeYISMaxPayload)
+        ? ((kBridgeWITMaxPayload > kBridgeFeymanMaxPayload)
+               ? kBridgeWITMaxPayload
+               : kBridgeFeymanMaxPayload)
+        : ((kBridgeYISMaxPayload > kBridgeFeymanMaxPayload)
+               ? kBridgeYISMaxPayload
+               : kBridgeFeymanMaxPayload);
 constexpr uint16_t kBridgeNonSyncMaxPayload =
     (kBridgePoseMaxPayload > kBridgeTimeSyncRespPayloadSize)
         ? kBridgePoseMaxPayload
@@ -92,13 +99,18 @@ constexpr uint16_t kBridgeMaxResponsePayload =
     (kBridgeControlMaxPayload > kBridgeSyncEventMaxPayload)
         ? kBridgeControlMaxPayload
         : kBridgeSyncEventMaxPayload;
+
+std::array<uint8_t, kBridgeFeymanMaxPayload> g_bridge_feyman_payload{};
+std::array<uint8_t, 5 + kBridgeMaxResponsePayload + 1>
+    g_bridge_response_frame{};
+Manager::FeymanArrayMsg g_bridge_feyman_snapshot{};
+
 constexpr uint32_t kBridgeWriteRetryCount = 3;
 constexpr uint32_t kBridgeWriteRetryDelayMs = 1;
 constexpr uint32_t kTaskCreateOverheadBytes = 384;
 constexpr uint32_t kTaskCreateSafetyBytes = 256;
 constexpr size_t kYISBridgeQueueDepth = 32;
 constexpr uint8_t kYISBridgeAddress = 0x6A;
-constexpr uint8_t kFeymanBridgeAddress = 0x7F;
 constexpr float kGravityMps2 = 9.80665f;
 
 constexpr uint16_t BuildLeadingWITBridgeMask(uint8_t imu_count) {
@@ -288,10 +300,10 @@ void IMUUartBridgeTask::RunBridgeMode() {
         last_pose_push_ms_ = Thread::GetTime();
       }
     } else {
-      auto topic = Topic::Find("feyman_imu_pose");
+      auto topic = Topic::Find("feyman_imu_array");
       if (topic != nullptr) {
         feyman_subscriber_ =
-            new Topic::ASyncSubscriber<Manager::FeymanPoseMsg>(Topic(topic));
+            new Topic::ASyncSubscriber<Manager::FeymanArrayMsg>(Topic(topic));
       }
       if (feyman_subscriber_ != nullptr) {
         feyman_subscriber_->StartWaiting();
@@ -602,37 +614,50 @@ IMUUartBridgeTask::PublishResult IMUUartBridgeTask::PublishBridgePoseData() {
   }
 
   if (feyman_subscriber_ == nullptr || !feyman_subscriber_->Available()) {
-    has_latest_feyman_pose_ = false;
     return PublishResult::NONE;
   }
 
-  const Manager::FeymanPoseMsg& latest = feyman_subscriber_->GetData();
-  latest_feyman_pose_ = latest;
-  has_latest_feyman_pose_ = (latest.status == 0U);
+  g_bridge_feyman_snapshot = feyman_subscriber_->GetData();
   feyman_subscriber_->StartWaiting();
 
-  if (!has_latest_feyman_pose_) {
-    has_latest_feyman_pose_ = false;
+  auto& payload = g_bridge_feyman_payload;
+  uint8_t valid_count = 0U;
+  uint16_t cursor = 1U;
+  const float nan = std::numeric_limits<float>::quiet_NaN();
+
+  const uint8_t device_count = static_cast<uint8_t>(
+      std::min<size_t>(g_bridge_feyman_snapshot.device_count,
+                       g_bridge_feyman_snapshot.devices.size()));
+  for (uint8_t i = 0; i < device_count; ++i) {
+    const auto& device = g_bridge_feyman_snapshot.devices[i];
+    if (device.online == 0U || device.configured == 0U || device.status != 0U) {
+      continue;
+    }
+    if ((static_cast<size_t>(cursor) + kBridgeExtendedRecordSize) >
+        payload.size()) {
+      break;
+    }
+
+    payload[cursor++] = device.node_id;
+    const std::array<float, kBridgeExtendedFloatCount> values = {
+        nan,          nan,          nan,          device.acc[0], device.acc[1],
+        device.acc[2], device.gyro[0], device.gyro[1], device.gyro[2], nan,
+        nan,          nan,          nan};
+    for (const float value : values) {
+      std::memcpy(payload.data() + cursor, &value, sizeof(float));
+      cursor = static_cast<uint16_t>(cursor + sizeof(float));
+    }
+    ++valid_count;
+  }
+
+  if (valid_count == 0U) {
     return PublishResult::NONE;
   }
-  std::array<uint8_t, 1 + kBridgeExtendedRecordSize> payload{};
-  payload[0] = 1;
-  payload[1] = kFeymanBridgeAddress;
 
-  uint16_t cursor = 2;
-  const float nan = std::numeric_limits<float>::quiet_NaN();
-  const std::array<float, kBridgeExtendedFloatCount> values = {
-      nan,          nan,          nan,          latest.acc[0],  latest.acc[1],
-      latest.acc[2], latest.gyro[0], latest.gyro[1], latest.gyro[2], nan,
-      nan,          nan,          nan};
-  for (const float value : values) {
-    std::memcpy(payload.data() + cursor, &value, sizeof(float));
-    cursor = static_cast<uint16_t>(cursor + sizeof(float));
-  }
+  payload[0] = valid_count;
 
   if (SendResponse(kBridgeCmdPosePush, payload.data(), cursor)) {
     last_pose_push_ms_ = now_ms;
-    has_latest_feyman_pose_ = false;
     return PublishResult::SENT;
   }
 
@@ -735,7 +760,6 @@ void IMUUartBridgeTask::ClearPendingPoseData() {
     feyman_subscriber_->StartWaiting();
   }
   has_latest_yis_pose_ = false;
-  has_latest_feyman_pose_ = false;
 }
 
 bool IMUUartBridgeTask::WriteString(const char* str) {
@@ -787,7 +811,7 @@ bool IMUUartBridgeTask::SendResponse(uint8_t cmd, const uint8_t* payload,
     return false;
   }
 
-  std::array<uint8_t, 5 + kBridgeMaxResponsePayload + 1> frame{};
+  auto& frame = g_bridge_response_frame;
   frame[0] = kBridgeSof0;
   frame[1] = kBridgeSof1;
   frame[2] = cmd;

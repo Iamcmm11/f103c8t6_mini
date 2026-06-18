@@ -83,9 +83,16 @@ void FeymanCanopenTask::TaskEntry(FeymanCanopenTask* task) {
 }
 
 void FeymanCanopenTask::Run() {
-  Logf("[feyman] start node=0x%02X baud=%lu rate=%lu", config_.node_id,
-       static_cast<unsigned long>(config_.baudrate),
-       static_cast<unsigned long>(config_.data_rate_hz));
+  if (config_.connect_node_id == config_.node_id) {
+    Logf("[feyman] start node=0x%02X baud=%lu rate=%lu", config_.node_id,
+         static_cast<unsigned long>(config_.baudrate),
+         static_cast<unsigned long>(config_.data_rate_hz));
+  } else {
+    Logf("[feyman] start node=0x%02X->0x%02X baud=%lu rate=%lu",
+         config_.connect_node_id, config_.node_id,
+         static_cast<unsigned long>(config_.baudrate),
+         static_cast<unsigned long>(config_.data_rate_hz));
+  }
 
   LibXR::Thread::Sleep(config_.startup_delay_ms);
   LogConfig("[feyman] configure begin");
@@ -231,6 +238,7 @@ void FeymanCanopenTask::LogCanErrorState(const char* context) {
 
 Module::FeymanMCS10Config FeymanCanopenTask::BuildDeviceConfig() const {
   Module::FeymanMCS10Config device_config;
+  device_config.connect_node_id = config_.connect_node_id;
   device_config.node_id = config_.node_id;
   device_config.baudrate = config_.baudrate;
   device_config.data_rate_hz = config_.data_rate_hz;
