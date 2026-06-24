@@ -54,6 +54,8 @@ class IMUUartBridgeTask {
 
  private:
   static void TaskEntry(IMUUartBridgeTask* arg);
+  static void OnFeymanSampleTopic(bool in_isr, IMUUartBridgeTask* task,
+                                  LibXR::RawData& data);
   enum class CommandParserState : uint8_t {
     WAIT_SOF0,
     WAIT_SOF1,
@@ -81,6 +83,9 @@ class IMUUartBridgeTask {
   bool SetStreamingEnabled(bool enable);
   void ClearPendingPushData();
   void ClearPendingPoseData();
+  bool PushFeymanSample(const Manager::FeymanDeviceMsg& sample);
+  bool PopFeymanSample(Manager::FeymanDeviceMsg& sample);
+  size_t GetFeymanQueueSize() const;
   bool WriteString(const char* str);
   bool WriteExact(const uint8_t* buf, uint16_t len);
   bool WriteSPI(const uint8_t* buf, uint16_t len);
@@ -103,6 +108,7 @@ class IMUUartBridgeTask {
   uint8_t CalcSum(const uint8_t* buf, uint16_t len) const;
 
   static constexpr uint16_t kCommandPayloadBufferSize = 1024;
+  static constexpr uint8_t kFeymanQueueCapacity = 16;
 
   LibXR::UART* uart_;
   LibXR::I2C* i2c_;
@@ -117,7 +123,7 @@ class IMUUartBridgeTask {
   LibXR::Topic::ASyncSubscriber<Manager::IMUArrayMsg>* wit_subscriber_;
   LibXR::LockFreeQueue<Manager::YISPoseMsg>* yis_queue_;
   LibXR::Topic::QueuedSubscriber* yis_queue_subscriber_;
-  LibXR::Topic::ASyncSubscriber<Manager::FeymanArrayMsg>* feyman_subscriber_;
+  LibXR::Topic::Callback feyman_topic_callback_{};
   LibXR::LockFreeQueue<uint8_t> gpio_button_queue_;
   CommandParserState command_parser_state_ = CommandParserState::WAIT_SOF0;
   std::array<uint8_t, kCommandPayloadBufferSize> command_payload_{};
@@ -129,6 +135,18 @@ class IMUUartBridgeTask {
   bool has_pending_gpio_button_command_ = false;
   Manager::YISPoseMsg latest_yis_pose_{};
   bool has_latest_yis_pose_ = false;
+  std::array<Manager::FeymanDeviceMsg, Manager::MAX_FEYMAN_DEVICE_COUNT>
+      pending_feyman_samples_{};
+  uint8_t pending_feyman_sample_count_ = 0;
+  std::array<Manager::FeymanDeviceMsg, kFeymanQueueCapacity> feyman_queue_{};
+  volatile uint8_t feyman_queue_head_ = 0;
+  volatile uint8_t feyman_queue_tail_ = 0;
+  volatile uint8_t feyman_queue_count_ = 0;
+  std::array<uint8_t, Manager::MAX_FEYMAN_DEVICE_COUNT> last_feyman_node_ids_{};
+  std::array<uint16_t, Manager::MAX_FEYMAN_DEVICE_COUNT>
+      last_feyman_sequences_{};
+  std::array<bool, Manager::MAX_FEYMAN_DEVICE_COUNT>
+      last_feyman_sequence_valid_{};
   std::array<Manager::SyncEventRecord, 8> pending_sync_events_{};
   uint8_t pending_sync_event_count_ = 0;
 };

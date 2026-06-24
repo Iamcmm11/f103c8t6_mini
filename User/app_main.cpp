@@ -195,6 +195,7 @@ extern "C" void app_main(void) {
   feyman_config.primary_node_id = 0x7E;
   feyman_config.aggregate_topic_name = "feyman_imu_array";
   feyman_config.legacy_topic_name = "feyman_imu_pose";
+  feyman_config.sample_topic_name = "feyman_imu_sample";
   feyman_config.priority =
       static_cast<uint32_t>(LibXR::Thread::Priority::HIGH);
   feyman_config.stack_size = 3072;
@@ -241,7 +242,7 @@ extern "C" void app_main(void) {
   bridge_config.wit_push_imu_count = wit_acq_config.enabled_imu_count;
   bridge_config.stream_interval_ms = 0;   //桥接推送频率不再设置为50hz或者200hz，根据底层数据输出频率决定，上层不加限制
   bridge_config.priority = static_cast<uint32_t>(LibXR::Thread::Priority::MEDIUM);
-  bridge_config.stack_size = 1536;
+  bridge_config.stack_size = 2048;
   static ::Application::IMUUartBridgeTask imu_bridge(
       &usart1, &i2c1, &spi1, &imu_manager, &ws2812_manager, bridge_config);
 

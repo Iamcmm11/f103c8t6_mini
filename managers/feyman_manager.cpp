@@ -26,7 +26,8 @@ ErrorCode FeymanManager::Init(const FeymanManagerConfig& config) {
   if (config.can == nullptr || config.devices == nullptr ||
       config.device_count == 0U || config.device_count > devices_.size() ||
       config.aggregate_topic_name == nullptr ||
-      config.legacy_topic_name == nullptr || config.stack_size == 0U) {
+      config.legacy_topic_name == nullptr || config.sample_topic_name == nullptr ||
+      config.stack_size == 0U) {
     return ErrorCode::ARG_ERR;
   }
 
@@ -51,6 +52,10 @@ ErrorCode FeymanManager::Init(const FeymanManagerConfig& config) {
     delete legacy_topic_;
     legacy_topic_ = nullptr;
   }
+  if (sample_topic_ != nullptr) {
+    delete sample_topic_;
+    sample_topic_ = nullptr;
+  }
 
   aggregate_topic_ = new LibXR::Topic(config.aggregate_topic_name,
                                       sizeof(FeymanArrayMsg), nullptr, false,
@@ -63,6 +68,17 @@ ErrorCode FeymanManager::Init(const FeymanManagerConfig& config) {
                                    sizeof(FeymanPoseMsg), nullptr, false,
                                    false, false);
   if (legacy_topic_ == nullptr) {
+    delete aggregate_topic_;
+    aggregate_topic_ = nullptr;
+    return ErrorCode::NO_MEM;
+  }
+
+  sample_topic_ = new LibXR::Topic(config.sample_topic_name,
+                                   sizeof(FeymanDeviceMsg), nullptr, false,
+                                   false, false);
+  if (sample_topic_ == nullptr) {
+    delete legacy_topic_;
+    legacy_topic_ = nullptr;
     delete aggregate_topic_;
     aggregate_topic_ = nullptr;
     return ErrorCode::NO_MEM;
@@ -81,6 +97,7 @@ ErrorCode FeymanManager::Init(const FeymanManagerConfig& config) {
 
 ErrorCode FeymanManager::Start() {
   if (aggregate_topic_ == nullptr || legacy_topic_ == nullptr ||
+      sample_topic_ == nullptr ||
       config_.can == nullptr) {
     return ErrorCode::INIT_ERR;
   }
@@ -293,6 +310,9 @@ bool FeymanManager::PollDevicesAndPublish() {
 
     if (runtime.config.node_id == config_.primary_node_id) {
       PublishLegacyIfPrimaryUpdated(msg);
+    }
+    if (sample_topic_ != nullptr) {
+      sample_topic_->Publish(msg);
     }
     if (aggregate_window_start_us_ == 0U) {
       aggregate_window_start_us_ = msg.timestamp_us;

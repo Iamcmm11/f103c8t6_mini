@@ -13,7 +13,8 @@ Run from repo root with utils/python path:
   python utils/python/imu_uart_bridge_test.py --port COM13 led-blink 3 255 0 0 --delay-ms 300
   python utils/python/imu_uart_bridge_test.py --port COM13 console
   python utils/python/imu_uart_bridge_test.py --port COM13 --baud 460800 sync-monitor
-  python utils/python/imu_uart_bridge_test.py --port COM14 rate-monitor --addr 0x7F --expected-hz 250
+  python utils/python/imu_uart_bridge_test.py --port COM14 rate-monitor --addr 0x7F --expected-hz 100
+  python utils/python/imu_uart_bridge_test.py --port COM14 rate-monitor --duration-s 10 --expected-total-hz 200 --expected-addr-hz 100
 Run from repo root with scripts path:
   python scripts/imu_uart_bridge_test.py --port /dev/ttyTHS1 ping
   python scripts/imu_uart_bridge_test.py --port /dev/ttyTHS1 start
@@ -108,6 +109,7 @@ IMU_PUSH_EXTENDED_FLOAT_COUNT = 13
 IMU_PUSH_EXTENDED_RECORD_SIZE = struct.calcsize(
     "<B" + ("f" * IMU_PUSH_EXTENDED_FLOAT_COUNT)
 )
+IMU_PUSH_FEYMAN_SAMPLE_RECORD_SIZE = struct.calcsize("<BBBHHHQQffffff")
 DEFAULT_IMU_ADDR_COLUMNS = [0x50, 0x51, 0x52, 0x53, 0x54, 0x55]
 ANSI_RESET = "\033[0m"
 ANSI_ADDR_COLOR = {
@@ -135,6 +137,10 @@ class IMUPushRecord:
     sensor_mcu_tick_us: Optional[int] = None
     readout_mcu_tick_us: Optional[int] = None
     time_status: Optional[int] = None
+    status: Optional[int] = None
+    sequence: Optional[int] = None
+    status_flags: Optional[int] = None
+    heartbeat_state: Optional[int] = None
     acc_x: float = math.nan
     acc_y: float = math.nan
     acc_z: float = math.nan
@@ -295,8 +301,11 @@ class AddressRateStats:
     step_count: int = 0
     step_min_ns: Optional[int] = None
     step_max_ns: Optional[int] = None
+    last_sequence: Optional[int] = None
 
-    def update(self, rx_monotonic_ns: int) -> None:
+    def update(self, rx_monotonic_ns: int, record: IMUPushRecord) -> bool:
+        if record.sequence is not None and self.last_sequence == record.sequence:
+            return False
         if self.first_ns is None:
             self.first_ns = rx_monotonic_ns
         if self.prev_ns is not None:
@@ -310,6 +319,9 @@ class AddressRateStats:
         self.record_count += 1
         self.prev_ns = rx_monotonic_ns
         self.last_ns = rx_monotonic_ns
+        if record.sequence is not None:
+            self.last_sequence = record.sequence
+        return True
 
     def elapsed_s(self) -> float:
         if self.first_ns is None or self.last_ns is None:
@@ -370,7 +382,6 @@ class RateMonitorStats:
             self.start_ns = rx_meta.rx_monotonic_ns
         self.last_ns = rx_meta.rx_monotonic_ns
         self.bundle_count += 1
-        self.record_count += len(selected)
         self.payload_bytes += rx_meta.payload_len
         self.frame_bytes += rx_meta.frame_len
 
@@ -379,7 +390,8 @@ class RateMonitorStats:
             if state is None:
                 state = AddressRateStats(imu_addr=record.imu_addr)
                 self.per_addr[record.imu_addr] = state
-            state.update(rx_meta.rx_monotonic_ns)
+            if state.update(rx_meta.rx_monotonic_ns, record):
+                self.record_count += 1
 
     def elapsed_s(self) -> float:
         if self.start_ns is None or self.last_ns is None:
@@ -804,6 +816,14 @@ def format_imu_json_row(
             imu["sample_timestamp"] = record.sample_timestamp
         if record.time_status is not None:
             imu["time_status"] = record.time_status
+        if record.status is not None:
+            imu["status"] = record.status
+        if record.sequence is not None:
+            imu["sequence"] = record.sequence
+        if record.status_flags is not None:
+            imu["status_flags"] = record.status_flags
+        if record.heartbeat_state is not None:
+            imu["heartbeat_state"] = record.heartbeat_state
         if sync_quality is not None:
             sync_version = sync_quality.get("mapping_version")
             if sync_version is not None:
@@ -1208,6 +1228,8 @@ class BridgeClient:
                         format_addr_with_color(record.imu_addr),
                     ]
                 )
+                if record.sequence is not None:
+                    parts.append(f"seq={record.sequence}")
                 if has_rpy:
                     parts.append(
                         f"rpy=({record.roll_deg:.3f},{record.pitch_deg:.3f},{record.yaw_deg:.3f})"
@@ -1308,6 +1330,7 @@ class BridgeClient:
             IMU_PUSH_WIT_POSE_RECORD_SIZE,
             IMU_PUSH_YIS_POSE_RECORD_SIZE,
             IMU_PUSH_YIS_EXTENDED_POSE_RECORD_SIZE,
+            IMU_PUSH_FEYMAN_SAMPLE_RECORD_SIZE,
             IMU_PUSH_EXTENDED_RECORD_SIZE,
         ):
             return None
@@ -1474,6 +1497,29 @@ class BridgeClient:
                 quat_x=values[11],
                 quat_y=values[12],
                 quat_z=values[13],
+            )
+
+        if len(payload) == IMU_PUSH_FEYMAN_SAMPLE_RECORD_SIZE:
+            values = struct.unpack("<BBBHHHQQffffff", payload)
+            sensor_mcu_tick_us = values[6] if values[6] != 0 else None
+            return IMUPushRecord(
+                imu_addr=values[0],
+                roll_deg=math.nan,
+                pitch_deg=math.nan,
+                yaw_deg=math.nan,
+                time_status=values[2],
+                status=values[1],
+                sequence=values[3],
+                status_flags=values[4],
+                heartbeat_state=values[5],
+                sensor_mcu_tick_us=sensor_mcu_tick_us,
+                readout_mcu_tick_us=values[7],
+                acc_x=values[8],
+                acc_y=values[9],
+                acc_z=values[10],
+                gyro_x=values[11],
+                gyro_y=values[12],
+                gyro_z=values[13],
             )
 
         raise ValueError(f"unsupported imu record size: {len(payload)}")
@@ -2044,14 +2090,22 @@ def _print_rate_summary(
     stats: RateMonitorStats,
     *,
     label: str,
-    expected_hz: float,
+    expected_total_hz: float,
+    expected_addr_hz: float,
 ) -> None:
     print(_format_rate_line(stats, label=label), flush=True)
+    if expected_total_hz > 0.0:
+        ratio = stats.record_hz() / expected_total_hz * 100.0
+        print(
+            f"{label}_expected,total_hz,{expected_total_hz:.2f},"
+            f"total_ratio,{ratio:.1f}%",
+            flush=True,
+        )
     for addr in sorted(stats.per_addr):
         print(
             _format_addr_rate_line(
                 stats.per_addr[addr],
-                expected_hz=expected_hz,
+                expected_hz=expected_addr_hz,
             ),
             flush=True,
         )
@@ -2060,6 +2114,12 @@ def _print_rate_summary(
 def cmd_rate_monitor(client: BridgeClient, args: argparse.Namespace) -> int:
     active = send_stream_start(client, args)
     addr_text = "all" if args.addr is None else f"0x{args.addr:02X}"
+    expected_total_hz = (
+        args.expected_total_hz if args.expected_total_hz > 0.0 else args.expected_hz
+    )
+    expected_addr_hz = (
+        args.expected_addr_hz if args.expected_addr_hz > 0.0 else args.expected_hz
+    )
     print(
         "Rate-monitor started: "
         f"active={int(active)}, addr={addr_text}, "
@@ -2094,7 +2154,8 @@ def cmd_rate_monitor(client: BridgeClient, args: argparse.Namespace) -> int:
                     _print_rate_summary(
                         stats,
                         label="rate",
-                        expected_hz=args.expected_hz,
+                        expected_total_hz=expected_total_hz,
+                        expected_addr_hz=expected_addr_hz,
                     )
                 next_print = now + args.print_interval_s
             time.sleep(0.05)
@@ -2106,7 +2167,8 @@ def cmd_rate_monitor(client: BridgeClient, args: argparse.Namespace) -> int:
             _print_rate_summary(
                 stats,
                 label="rate_final",
-                expected_hz=args.expected_hz,
+                expected_total_hz=expected_total_hz,
+                expected_addr_hz=expected_addr_hz,
             )
         try:
             active = send_stream_stop(client, args)
@@ -2454,7 +2516,19 @@ def build_parser() -> argparse.ArgumentParser:
         "--expected-hz",
         type=float,
         default=0.0,
-        help="expected record rate for ratio display, e.g. 250",
+        help="legacy expected rate fallback used for both total and per-address display",
+    )
+    rate_monitor_parser.add_argument(
+        "--expected-total-hz",
+        type=float,
+        default=0.0,
+        help="expected total record rate across all selected addresses, e.g. 200",
+    )
+    rate_monitor_parser.add_argument(
+        "--expected-addr-hz",
+        type=float,
+        default=0.0,
+        help="expected per-address record rate, e.g. 100 for each FEYMAN node",
     )
     rate_monitor_parser.set_defaults(func=cmd_rate_monitor)
 

@@ -26,6 +26,7 @@ struct FeymanManagerConfig {
   uint8_t primary_node_id = 0x7F;
   const char* aggregate_topic_name = "feyman_imu_array";
   const char* legacy_topic_name = "feyman_imu_pose";
+  const char* sample_topic_name = "feyman_imu_sample";
   uint32_t priority = static_cast<uint32_t>(LibXR::Thread::Priority::HIGH);
   uint32_t stack_size = 3072;
   uint32_t startup_delay_ms = 50;
@@ -85,6 +86,7 @@ class FeymanManager {
   LibXR::CAN::Callback can_callback_{};
   LibXR::Topic* aggregate_topic_ = nullptr;
   LibXR::Topic* legacy_topic_ = nullptr;
+  LibXR::Topic* sample_topic_ = nullptr;
   LibXR::Mutex op_mutex_{};
   volatile bool thread_alive_ = false;
   volatile bool active_ = false;
