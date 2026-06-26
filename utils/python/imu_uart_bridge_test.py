@@ -14,7 +14,7 @@ Run from repo root with utils/python path:
   python utils/python/imu_uart_bridge_test.py --port COM13 console
   python utils/python/imu_uart_bridge_test.py --port COM13 --baud 460800 sync-monitor
   python utils/python/imu_uart_bridge_test.py --port COM14 rate-monitor --addr 0x7F --expected-hz 100
-  python utils/python/imu_uart_bridge_test.py --port COM14 rate-monitor --duration-s 10 --expected-total-hz 200 --expected-addr-hz 100
+  python utils/python/imu_uart_bridge_test.py --port COM14 rate-monitor --duration-s 10 --expected-total-hz 500 --expected-addr-hz 250
 Run from repo root with scripts path:
   python scripts/imu_uart_bridge_test.py --port /dev/ttyTHS1 ping
   python scripts/imu_uart_bridge_test.py --port /dev/ttyTHS1 start
@@ -1501,13 +1501,16 @@ class BridgeClient:
 
         if len(payload) == IMU_PUSH_FEYMAN_SAMPLE_RECORD_SIZE:
             values = struct.unpack("<BBBHHHQQffffff", payload)
-            sensor_mcu_tick_us = values[6] if values[6] != 0 else None
+            time_status = values[2]
+            sensor_mcu_tick_us = (
+                values[6] if values[6] != 0 or (time_status & 0x01) != 0 else None
+            )
             return IMUPushRecord(
                 imu_addr=values[0],
                 roll_deg=math.nan,
                 pitch_deg=math.nan,
                 yaw_deg=math.nan,
-                time_status=values[2],
+                time_status=time_status,
                 status=values[1],
                 sequence=values[3],
                 status_flags=values[4],

@@ -65,10 +65,7 @@
   - 实际现象为 `UART5` 日志停在 `pose=FEYMAN topic=1` 后，`USART1` 无法 ping 通。
   - 该问题在当前堆/线程环境下风险较高，表现更像 bridge 线程在 sample 队列创建阶段异常退出或卡死。
   - 已改为 bridge 内部固定容量环形缓冲 + topic callback 入队，不再依赖该路径上的动态堆分配。
-- 当前 bridge 还补充了 `UART5` 周期诊断日志，用于区分：
-  - 线程未进入主循环；
-  - `USART1` TX 背压导致命令应答发不出去；
-  - FEYMAN sample 环形缓冲满导致掉样。
+- 曾临时补充过 `UART5` bridge 周期诊断日志，用于区分线程启动、`USART1` TX 背压和 sample 环形缓冲满等问题；当前问题收敛后，该周期诊断日志已从固件中移除，避免长期占用 UART5 日志带宽。
 
 ## 当前测试结果
 - 构建与工具检查通过：
@@ -87,3 +84,17 @@
   - 两个设备单地址接收率均稳定在 `100 Hz` 左右。
   - `sequence` 连续、无缺失、无重复、无回退，说明当前 10 秒窗口内数采链路未见掉样。
   - `host_step_min_ms=0.0`、`host_step_max_ms=32.0` 只反映 host 接收与 bundle 合包节拍抖动，不代表 sample 丢失。
+
+## USART1 速率预算
+- 当前 USART1 配置为 `460800 baud`，8N1 串口有效线速约为 `46080 byte/s`。
+- FEYMAN 新 sample record 固定为 `49 byte`；外层 `0x30` frame 还包含 `count`、帧头、长度和 checksum。
+- 若一帧只带 1 条 FEYMAN record，链路开销约为 `56 byte/record`；若经常合包 2 条 record，约为 `52.5 byte/record`；4 条 record 时约为 `50.75 byte/record`。
+- 两台 FEYMAN 同时输出时，串口预算建议如下：
+  - `data_rate_hz = 100`：总 `200 records/s`，约 `10.2~11.2 KB/s`，当前实测稳定。
+  - `data_rate_hz = 200`：总 `400 records/s`，约 `20.3~22.4 KB/s`，仍在 `460800 baud` 合理范围内，建议作为当前 USART1 协议下的高速数采档。
+  - `data_rate_hz = 500`：总 `1000 records/s`，约 `50.8~56.0 KB/s`，已经接近或超过 `460800 baud` 理论线速，不适合用当前 49-byte float record 直接输出。
+  - `data_rate_hz = 1000`：总 `2000 records/s`，约 `101.5~112.0 KB/s`，当前 USART1 配置明确无法承载。
+- 当前建议：
+  - 常规数采使用 `100 Hz/device`。
+  - 高速数采优先验证 `200 Hz/device`。
+  - `500 Hz/device` 以上只适合先验证 CAN 侧采集能力；若要稳定从 USART1 输出，需要提高波特率到 `921600`、`1500000` 或 `2000000`，并考虑压缩 record 格式或更换高速输出通道。

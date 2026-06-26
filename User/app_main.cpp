@@ -201,7 +201,7 @@ extern "C" void app_main(void) {
   feyman_config.stack_size = 3072;
   feyman_config.startup_delay_ms = 50;
   feyman_config.baudrate = 250000;
-  feyman_config.data_rate_hz = 100;
+  feyman_config.data_rate_hz = 200;
   feyman_config.heartbeat_ms = 1000;
   feyman_config.sdo_timeout_ms = 200;
   feyman_config.sdo_inter_request_delay_ms = 5;

@@ -97,12 +97,17 @@ LibXR::ErrorCode SyncSignalManager::StartAll() {
   sync_event_queue.active = true;
   taskEXIT_CRITICAL();
 
+  std::array<bool, kSyncEventSourceCount> start_event_recorded{};
   for (size_t i = 0; i < output_count_; ++i) {
     const SyncPwmOutputConfig& output = outputs_[i];
     const LibXR::ErrorCode ec = output.pwm->Enable();
     last_start_results_[i] = ec;
     if (ec == LibXR::ErrorCode::OK) {
-      RecordEvent(output.source, session_start_mcu_tick_us);
+      const size_t source_index = SourceIndex(output.source);
+      if (!start_event_recorded[source_index]) {
+        RecordEvent(output.source, session_start_mcu_tick_us);
+        start_event_recorded[source_index] = true;
+      }
     } else if (final_result == LibXR::ErrorCode::OK) {
       final_result = ec;
     }
